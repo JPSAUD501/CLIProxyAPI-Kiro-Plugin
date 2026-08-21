@@ -15,6 +15,45 @@ import (
 	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
 )
 
+func TestNormalizeFormat(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"openai-response":         "openai-response",
+		"responses":               "openai-response",
+		"openai-responses":        "openai-response",
+		"claude":                  "claude",
+		"anthropic":               "claude",
+		"messages":                "claude",
+		"openai":                  "openai",
+		"chat-completions":        "openai",
+		"openai-chat-completions": "openai",
+	}
+	for input, want := range tests {
+		if got := normalizeFormat(input); got != want {
+			t.Errorf("normalizeFormat(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestPluginRegistrationAdvertisesNativeProtocols(t *testing.T) {
+	t.Parallel()
+
+	registration := pluginRegistration()
+	for label, formats := range map[string][]string{
+		"input":  registration.Capabilities.ExecutorInputFormats,
+		"output": registration.Capabilities.ExecutorOutputFormats,
+	} {
+		want := map[string]bool{"openai-response": true, "claude": true, "openai": true}
+		for _, format := range formats {
+			delete(want, format)
+		}
+		if len(want) != 0 {
+			t.Errorf("missing executor %s formats: %v", label, want)
+		}
+	}
+}
+
 func TestIDCRefreshIntegration(t *testing.T) {
 	path := os.Getenv("KIRO_INTEGRATION_TOKEN_PATH")
 	if path == "" {

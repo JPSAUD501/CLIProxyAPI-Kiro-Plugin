@@ -96,11 +96,12 @@ func ConvertKiroStreamToOpenAI(ctx context.Context, model string, originalReques
 			// Thinking block starting - nothing to emit yet for OpenAI
 		case "tool_use":
 			// Tool use block starting
+			blockIndex := int(eventJSON.Get("index").Int())
 			toolUseID := eventJSON.Get("content_block.id").String()
 			toolName := eventJSON.Get("content_block.name").String()
-			chunk := BuildOpenAISSEToolCallStart(state, toolUseID, toolName)
+			toolIndex := state.StartToolCall(blockIndex)
+			chunk := BuildOpenAISSEToolCallStart(state, toolUseID, toolName, toolIndex)
 			results = append(results, chunk)
-			state.ToolCallIndex++
 		}
 
 	case "content_block_delta":
@@ -123,9 +124,13 @@ func ConvertKiroStreamToOpenAI(ctx context.Context, model string, originalReques
 			// Tool call arguments delta
 			partialJSON := eventJSON.Get("delta.partial_json").String()
 			if partialJSON != "" {
-				// Get the tool index from content block index
 				blockIndex := int(eventJSON.Get("index").Int())
-				chunk := BuildOpenAISSEToolCallArgumentsDelta(state, partialJSON, blockIndex-1) // Adjust for 0-based tool index
+				toolIndex, ok := state.ToolIndex(blockIndex)
+				if !ok {
+					log.Warnf("kiro-openai: ignoring arguments for unknown tool content block %d", blockIndex)
+					return []string{}
+				}
+				chunk := BuildOpenAISSEToolCallArgumentsDelta(state, partialJSON, toolIndex)
 				results = append(results, chunk)
 			}
 		}

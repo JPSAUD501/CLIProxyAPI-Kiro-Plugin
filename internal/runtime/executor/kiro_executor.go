@@ -24,6 +24,7 @@ import (
 	kiroclaude "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/claude"
 	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
 	kiroopenai "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/openai"
+	_ "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/responses"
 	"github.com/google/uuid"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -526,6 +527,11 @@ func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, 
 	case "openai":
 		log.Debugf("kiro: using OpenAI payload builder for source format: %s", sourceFormat.String())
 		return kiroopenai.BuildKiroPayloadFromOpenAI(body, modelID, profileArn, origin, headers, nil)
+	case "openai-response":
+		// The registered Responses request translator converts the request to
+		// Claude format before it reaches the executor.
+		log.Debugf("kiro: using Claude payload builder for Responses request")
+		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, headers, nil)
 	case "kiro":
 		// Body is already in Kiro format — pass through directly
 		log.Debugf("kiro: body already in Kiro format, passing through directly")

@@ -71,7 +71,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.4.1"
+	pluginVersion     = "0.4.2"
 	maxPages          = 10
 )
 
@@ -332,8 +332,8 @@ func pluginRegistration() registration {
 			AuthProvider:          true,
 			Executor:              true,
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  []string{"openai", "claude", "chat-completions", "messages"},
-			ExecutorOutputFormats: []string{"openai", "claude", "chat-completions", "messages"},
+			ExecutorInputFormats:  []string{"openai-response", "claude", "openai"},
+			ExecutorOutputFormats: []string{"openai-response", "claude", "openai"},
 			ManagementAPI:         true,
 		},
 	}
@@ -753,11 +753,13 @@ func coreOptions(req pluginapi.ExecutorRequest) coreexec.Options {
 }
 
 func normalizeFormat(format string) string {
-	value := strings.ToLower(format)
-	switch {
-	case strings.Contains(value, "claude"), strings.Contains(value, "message"):
+	value := strings.ToLower(strings.TrimSpace(format))
+	switch value {
+	case "responses", "openai-response", "openai-responses", "openai_responses":
+		return "openai-response"
+	case "claude", "anthropic", "messages", "anthropic-messages":
 		return "claude"
-	case strings.Contains(value, "openai"), strings.Contains(value, "chat"):
+	case "openai", "chat-completions", "chat_completions", "openai-chat-completions", "openai_chat_completions":
 		return "openai"
 	default:
 		return value

@@ -15,6 +15,7 @@ import (
 type OpenAIStreamState struct {
 	ChunkIndex        int
 	ToolCallIndex     int
+	ToolIndexByBlock  map[int]int
 	HasSentFirstChunk bool
 	Model             string
 	ResponseID        string
@@ -26,11 +27,29 @@ func NewOpenAIStreamState(model string) *OpenAIStreamState {
 	return &OpenAIStreamState{
 		ChunkIndex:        0,
 		ToolCallIndex:     0,
+		ToolIndexByBlock:  make(map[int]int),
 		HasSentFirstChunk: false,
 		Model:             model,
 		ResponseID:        "chatcmpl-" + uuid.New().String()[:24],
 		Created:           time.Now().Unix(),
 	}
+}
+
+// StartToolCall assigns a stable OpenAI tool-call index to a Claude content
+// block. Claude block indexes include text and thinking blocks, so they cannot
+// be converted to tool indexes with arithmetic.
+func (state *OpenAIStreamState) StartToolCall(blockIndex int) int {
+	toolIndex := state.ToolCallIndex
+	state.ToolCallIndex++
+	state.ToolIndexByBlock[blockIndex] = toolIndex
+	return toolIndex
+}
+
+// ToolIndex returns the OpenAI tool-call index assigned when the corresponding
+// Claude tool_use block started.
+func (state *OpenAIStreamState) ToolIndex(blockIndex int) (int, bool) {
+	toolIndex, ok := state.ToolIndexByBlock[blockIndex]
+	return toolIndex, ok
 }
 
 // FormatSSEEvent formats a JSON payload for SSE streaming.
@@ -60,9 +79,9 @@ func BuildOpenAISSETextDelta(state *OpenAIStreamState, textDelta string) string 
 }
 
 // BuildOpenAISSEToolCallStart creates an SSE event for tool call start
-func BuildOpenAISSEToolCallStart(state *OpenAIStreamState, toolUseID, toolName string) string {
+func BuildOpenAISSEToolCallStart(state *OpenAIStreamState, toolUseID, toolName string, toolIndex int) string {
 	toolCall := map[string]interface{}{
-		"index": state.ToolCallIndex,
+		"index": toolIndex,
 		"id":    toolUseID,
 		"type":  "function",
 		"function": map[string]interface{}{
