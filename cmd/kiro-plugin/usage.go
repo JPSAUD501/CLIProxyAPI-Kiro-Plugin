@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,9 +36,9 @@ var (
 	usageLocks        sync.Map
 	usageState        = struct {
 		sync.Mutex
-		cache      map[string]usageCacheEntry
-		lastForced map[string]time.Time
-	}{cache: make(map[string]usageCacheEntry), lastForced: make(map[string]time.Time)}
+		cache       map[string]usageCacheEntry
+		lastRefresh map[string]time.Time
+	}{cache: make(map[string]usageCacheEntry), lastRefresh: make(map[string]time.Time)}
 	usageNow        = func() time.Time { return time.Now().UTC() }
 	usageHTTPClient = func() httpDoer {
 		return &http.Client{Timeout: usageRequestTimeout}
@@ -164,6 +165,15 @@ type usageCacheEntry struct {
 	FetchedAt time.Time
 }
 
+type usageCredential struct {
+	entry      pluginapi.HostAuthFileEntry
+	authRecord pluginapi.HostAuthGetResponse
+	raw        []byte
+	token      *kiroauth.KiroTokenData
+	cacheKey   string
+	err        error
+}
+
 func newUsageResourcePath() string {
 	random := make([]byte, 24)
 	if _, err := io.ReadFull(cryptorand.Reader, random); err != nil {
@@ -225,7 +235,7 @@ func refreshKiroCredential(ctx context.Context, token *kiroauth.KiroTokenData) (
 }
 
 func handleUsagePage(req pluginapi.ManagementRequest) ([]byte, error) {
-	accounts := collectUsageAccounts(context.Background(), req.Query.Get("refresh") == "1")
+	accounts := collectUsageAccounts(context.Background(), true)
 	page, err := renderUsagePage(accounts)
 	if err != nil {
 		return nil, err
@@ -249,7 +259,7 @@ func usagePageHeaders() http.Header {
 	return http.Header{
 		"Content-Type":            []string{"text/html; charset=utf-8"},
 		"Cache-Control":           []string{"no-store"},
-		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; form-action 'self'; base-uri 'none'"},
+		"Content-Security-Policy": []string{"default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'"},
 		"Referrer-Policy":         []string{"no-referrer"},
 		"X-Content-Type-Options":  []string{"nosniff"},
 	}
@@ -266,17 +276,18 @@ func collectUsageAccounts(ctx context.Context, force bool) []usageAccountView {
 			entries = append(entries, entry)
 		}
 	}
-	results := make([]usageAccountView, len(entries))
+	credentials := resolveUsageCredentials(entries)
+	results := make([]usageAccountView, len(credentials))
 	semaphore := make(chan struct{}, 4)
 	var group sync.WaitGroup
-	for index := range entries {
+	for index := range credentials {
 		index := index
 		group.Add(1)
 		go func() {
 			defer group.Done()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-			results[index] = loadUsageAccount(ctx, entries[index], force)
+			results[index] = loadUsageCredential(ctx, credentials[index], force)
 		}()
 	}
 	group.Wait()
@@ -284,8 +295,71 @@ func collectUsageAccounts(ctx context.Context, force bool) []usageAccountView {
 	return results
 }
 
+func resolveUsageCredentials(entries []pluginapi.HostAuthFileEntry) []usageCredential {
+	credentials := make([]usageCredential, 0, len(entries))
+	byIdentity := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		credential := usageCredential{entry: entry}
+		credential.authRecord, credential.raw, credential.token, credential.err = getHostKiroAuth(entry.AuthIndex)
+		credential.cacheKey = usageCredentialKey(credential.token, entry.AuthIndex, entry.Name)
+		if existing, found := byIdentity[credential.cacheKey]; found {
+			if usageEntryRank(entry) > usageEntryRank(credentials[existing].entry) {
+				credentials[existing] = credential
+			}
+			continue
+		}
+		byIdentity[credential.cacheKey] = len(credentials)
+		credentials = append(credentials, credential)
+	}
+	return credentials
+}
+
+func usageCredentialKey(token *kiroauth.KiroTokenData, authIndex, name string) string {
+	if token != nil {
+		if value := strings.TrimSpace(token.ClientIDHash); value != "" {
+			return "oidc:" + strings.ToLower(value)
+		}
+		if value := strings.TrimSpace(token.ClientID); value != "" {
+			return "client:" + stableCredentialHash(value)
+		}
+		if value := strings.TrimSpace(token.ProfileArn); value != "" {
+			return "profile:" + stableCredentialHash(value)
+		}
+	}
+	if value := strings.TrimSpace(authIndex); value != "" {
+		return "auth:" + value
+	}
+	return "name:" + strings.ToLower(strings.TrimSpace(name))
+}
+
+func stableCredentialHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func usageEntryRank(entry pluginapi.HostAuthFileEntry) int {
+	if entry.Disabled {
+		return 0
+	}
+	if entry.Unavailable {
+		return 1
+	}
+	return 2
+}
+
 func loadUsageAccount(ctx context.Context, entry pluginapi.HostAuthFileEntry, force bool) usageAccountView {
+	credential := usageCredential{entry: entry}
+	credential.authRecord, credential.raw, credential.token, credential.err = getHostKiroAuth(entry.AuthIndex)
+	credential.cacheKey = usageCredentialKey(credential.token, entry.AuthIndex, entry.Name)
+	return loadUsageCredential(ctx, credential, force)
+}
+
+func loadUsageCredential(ctx context.Context, credential usageCredential, force bool) usageAccountView {
+	entry := credential.entry
 	label := strings.TrimSpace(entry.Label)
+	if credential.token != nil {
+		label = kiroUsageLabel(credential.token)
+	}
 	if label == "" {
 		label = "Kiro"
 	}
@@ -297,30 +371,29 @@ func loadUsageAccount(ctx context.Context, entry pluginapi.HostAuthFileEntry, fo
 	}
 	forceRefresh := false
 	if force {
-		forceRefresh = allowForcedUsageRefresh(entry.AuthIndex)
+		forceRefresh = allowUsageRefresh(credential.cacheKey)
 		if !forceRefresh {
-			if cached, ok := cachedUsage(entry.AuthIndex); ok {
+			if cached, ok := cachedUsage(credential.cacheKey); ok {
 				return cached
 			}
 		}
-	} else if cached, ok := cachedUsage(entry.AuthIndex); ok {
+	} else if cached, ok := cachedUsage(credential.cacheKey); ok {
 		return cached
 	}
-
-	_, _, previewToken, previewErr := getHostKiroAuth(entry.AuthIndex)
-	if previewErr != nil {
-		return usageAccountView{Label: label, State: "Unavailable", StateClass: "error", Error: publicUsageError(previewErr)}
+	if credential.err != nil {
+		return usageAccountView{Label: label, State: "Unavailable", StateClass: "error", Error: publicUsageError(credential.err)}
 	}
-	lock := credentialUsageLock(previewToken, entry.AuthIndex)
+
+	lock := credentialUsageLock(credential.token, entry.AuthIndex)
 	lock.Lock()
 	defer lock.Unlock()
 	if !forceRefresh {
-		if cached, ok := cachedUsage(entry.AuthIndex); ok {
+		if cached, ok := cachedUsage(credential.cacheKey); ok {
 			return cached
 		}
 	}
 
-	account, err := fetchUsageForAuth(ctx, entry)
+	account, err := fetchUsageForCredential(ctx, credential)
 	if err != nil {
 		if strings.TrimSpace(account.Label) == "" {
 			account.Label = label
@@ -329,7 +402,7 @@ func loadUsageAccount(ctx context.Context, entry pluginapi.HostAuthFileEntry, fo
 		account.StateClass = "error"
 		account.Error = publicUsageError(err)
 	}
-	storeCachedUsage(entry.AuthIndex, account)
+	storeCachedUsage(credential.cacheKey, account)
 	return account
 }
 
@@ -338,6 +411,12 @@ func fetchUsageForAuth(ctx context.Context, entry pluginapi.HostAuthFileEntry) (
 	if err != nil {
 		return usageAccountView{}, err
 	}
+	return fetchUsageForCredential(ctx, usageCredential{entry: entry, authRecord: authRecord, raw: raw, token: token})
+}
+
+func fetchUsageForCredential(ctx context.Context, credential usageCredential) (usageAccountView, error) {
+	authRecord, raw, token := credential.authRecord, credential.raw, credential.token
+	var err error
 	label := kiroUsageLabel(token)
 	if credentialNeedsRefresh(token, usageNow()) {
 		token, raw, err = refreshAndSaveUsageCredential(ctx, authRecord.Name, raw, token)
@@ -569,14 +648,14 @@ func cachedUsage(key string) (usageAccountView, bool) {
 	return usageAccountView{}, false
 }
 
-func allowForcedUsageRefresh(key string) bool {
+func allowUsageRefresh(key string) bool {
 	now := usageNow()
 	usageState.Lock()
 	defer usageState.Unlock()
-	if last := usageState.lastForced[key]; !last.IsZero() && now.Sub(last) < usageRefreshFloor {
+	if last := usageState.lastRefresh[key]; !last.IsZero() && now.Sub(last) < usageRefreshFloor {
 		return false
 	}
-	usageState.lastForced[key] = now
+	usageState.lastRefresh[key] = now
 	return true
 }
 
@@ -607,14 +686,13 @@ const usagePageHTML = `<!doctype html>
 <title>Kiro Usage</title>
 <style>
 :root{color-scheme:dark;--page:#19161d;--surface:#211e25;--surface-2:#29252d;--text:#f3f0f5;--muted:#aaa4af;--border:#403a45;--accent:#8f72f4;--accent-2:#aa94fa;--danger:#ffb4c8;--success:#8ed8b2}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45}main{width:min(1080px,100%);margin:0 auto;padding:32px 24px 48px}.heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}h1{margin:0;font-size:24px;line-height:1.2;font-weight:650;letter-spacing:-.02em}.intro{margin:7px 0 0;color:var(--muted)}button{height:38px;padding:0 16px;border:1px solid #9c85ef;border-radius:7px;background:#7f5af0;color:#fff;font:600 14px/1 inherit;cursor:pointer}button:hover{background:#906ff5}button:focus-visible{outline:3px solid rgba(154,125,255,.4);outline-offset:2px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:16px}.card{min-width:0;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:0 14px 38px rgba(0,0,0,.17)}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.account{min-width:0;margin:0;font-size:16px;font-weight:650;overflow-wrap:anywhere}.state{flex:none;padding:3px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.04em}.state.active{border-color:#35634e;color:var(--success);background:#1d3028}.state.error{border-color:#704052;color:var(--danger);background:#302028}.plan{margin:8px 0 18px;color:var(--muted)}.bucket{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}.bucket:first-of-type{margin-top:0;padding-top:0;border-top:0}.bucket-title{margin:0 0 10px;font-size:14px;font-weight:650}.numbers{display:flex;align-items:baseline;gap:6px;margin-bottom:9px}.used{font-size:25px;font-weight:670;letter-spacing:-.025em}.limit{color:var(--muted)}.track{height:8px;overflow:hidden;border-radius:999px;background:#171419}.fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent-2))}.details{display:grid;grid-template-columns:1fr 1fr;gap:9px 18px;margin-top:13px}.detail span{display:block;color:var(--muted);font-size:12px}.detail strong{display:block;margin-top:2px;font-size:13px;font-weight:600;overflow-wrap:anywhere}.error-message,.empty{padding:18px;border:1px solid #704052;border-radius:9px;background:#302028;color:var(--danger)}.empty{max-width:620px}.updated{margin:18px 0 0;color:var(--muted);font-size:12px}@media(max-width:600px){main{padding:22px 14px 36px}.heading{display:block}.heading form{margin-top:18px}button{width:100%}.card{padding:18px}.details{grid-template-columns:1fr}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--page);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45}main{width:min(1080px,100%);margin:0 auto;padding:32px 24px 48px}.heading{margin-bottom:24px}h1{margin:0;font-size:24px;line-height:1.2;font-weight:650;letter-spacing:-.02em}.intro{margin:7px 0 0;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:16px}.card{min-width:0;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:0 14px 38px rgba(0,0,0,.17)}.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.account{min-width:0;margin:0;font-size:16px;font-weight:650;overflow-wrap:anywhere}.state{flex:none;padding:3px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted);font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:.04em}.state.active{border-color:#35634e;color:var(--success);background:#1d3028}.state.error{border-color:#704052;color:var(--danger);background:#302028}.plan{margin:8px 0 18px;color:var(--muted)}.bucket{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}.bucket:first-of-type{margin-top:0;padding-top:0;border-top:0}.bucket-title{margin:0 0 10px;font-size:14px;font-weight:650}.numbers{display:flex;align-items:baseline;gap:6px;margin-bottom:9px}.used{font-size:25px;font-weight:670;letter-spacing:-.025em}.limit{color:var(--muted)}.track{height:8px;overflow:hidden;border-radius:999px;background:#171419}.fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent-2))}.details{display:grid;grid-template-columns:1fr 1fr;gap:9px 18px;margin-top:13px}.detail span{display:block;color:var(--muted);font-size:12px}.detail strong{display:block;margin-top:2px;font-size:13px;font-weight:600;overflow-wrap:anywhere}.error-message,.empty{padding:18px;border:1px solid #704052;border-radius:9px;background:#302028;color:var(--danger)}.empty{max-width:620px}.updated{margin:18px 0 0;color:var(--muted);font-size:12px}@media(max-width:600px){main{padding:22px 14px 36px}.card{padding:18px}.details{grid-template-columns:1fr}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style>
 </head>
 <body>
 <main>
   <div class="heading">
     <div><h1>Kiro Usage</h1><p class="intro">Subscription usage reported by Kiro for each connected account.</p></div>
-    <form method="get"><button type="submit" name="refresh" value="1">Refresh</button></form>
   </div>
   {{if .Empty}}<div class="empty" role="status">No Kiro accounts are connected. Add one from OAuth Login.</div>{{else}}
   <div class="grid">

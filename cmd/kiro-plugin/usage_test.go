@@ -157,7 +157,7 @@ func TestUsagePageEscapesContentAndSetsSecurityHeaders(t *testing.T) {
 	}
 }
 
-func TestUsageCacheAndManualRefreshFloor(t *testing.T) {
+func TestUsageCacheAndRefreshFloor(t *testing.T) {
 	originalNow := usageNow
 	t.Cleanup(func() { usageNow = originalNow })
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
@@ -167,12 +167,12 @@ func TestUsageCacheAndManualRefreshFloor(t *testing.T) {
 	if cached, ok := cachedUsage("account"); !ok || cached.Label != "cached" {
 		t.Fatalf("expected fresh cached account, got %+v, %v", cached, ok)
 	}
-	if !allowForcedUsageRefresh("account") || allowForcedUsageRefresh("account") {
-		t.Fatal("manual refresh floor was not enforced")
+	if !allowUsageRefresh("account") || allowUsageRefresh("account") {
+		t.Fatal("refresh floor was not enforced")
 	}
 	now = now.Add(usageRefreshFloor)
-	if !allowForcedUsageRefresh("account") {
-		t.Fatal("manual refresh should be allowed after the floor")
+	if !allowUsageRefresh("account") {
+		t.Fatal("refresh should be allowed after the floor")
 	}
 	now = now.Add(usageCacheTTL)
 	if _, ok := cachedUsage("account"); ok {
@@ -246,6 +246,65 @@ func TestCollectUsageAccountsIsolatesAccountsAndFailures(t *testing.T) {
 	}
 	if byLabel["Kiro - disabled.awsapps.com"].State != "Disabled" {
 		t.Fatalf("disabled account was queried or hidden: %+v", byLabel)
+	}
+}
+
+func TestCollectUsageAccountsDeduplicatesCredentialIdentity(t *testing.T) {
+	originalHostCall := usageHostCall
+	originalHTTPClient := usageHTTPClient
+	originalNow := usageNow
+	t.Cleanup(func() {
+		usageHostCall = originalHostCall
+		usageHTTPClient = originalHTTPClient
+		usageNow = originalNow
+		resetUsageState()
+	})
+	resetUsageState()
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	usageNow = func() time.Time { return now }
+	tokens := map[string]*kiroauth.KiroTokenData{
+		"one-a": {AccessToken: "one-token", ProfileArn: "profile-one", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), StartURL: "https://shared.awsapps.com/start", Region: "us-east-1", ClientIDHash: "one-hash"},
+		"one-b": {AccessToken: "one-token", ProfileArn: "profile-one", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), StartURL: "https://shared.awsapps.com/start", Region: "us-east-1", ClientIDHash: "one-hash"},
+		"two":   {AccessToken: "two-token", ProfileArn: "profile-two", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), StartURL: "https://shared.awsapps.com/start", Region: "us-east-1", ClientIDHash: "two-hash"},
+	}
+	usageHostCall = func(method string, request []byte) ([]byte, error) {
+		switch method {
+		case pluginabi.MethodHostAuthList:
+			return okEnvelope(hostAuthListResponse{Files: []pluginapi.HostAuthFileEntry{
+				{AuthIndex: "one-a", Name: "one.json", Provider: "kiro"},
+				{AuthIndex: "one-b", Name: "one.json", Provider: "kiro"},
+				{AuthIndex: "two", Name: "two.json", Provider: "kiro"},
+			}})
+		case pluginabi.MethodHostAuthGet:
+			var get pluginapi.HostAuthGetRequest
+			if err := json.Unmarshal(request, &get); err != nil {
+				return nil, err
+			}
+			raw, _ := json.Marshal(tokens[get.AuthIndex])
+			return okEnvelope(pluginapi.HostAuthGetResponse{AuthIndex: get.AuthIndex, Name: get.AuthIndex + ".json", JSON: raw})
+		default:
+			return errorEnvelope("unexpected", method), nil
+		}
+	}
+	var requestMu sync.Mutex
+	requestCount := 0
+	usageHTTPClient = func() httpDoer {
+		return httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+			requestMu.Lock()
+			requestCount++
+			requestMu.Unlock()
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"subscriptionInfo":{"subscriptionTitle":"Kiro Pro"},"usageBreakdownList":[{"displayNamePlural":"Credits","currentUsage":1,"usageLimit":50}]}`)), Header: make(http.Header)}, nil
+		})
+	}
+
+	accounts := collectUsageAccounts(context.Background(), false)
+	if len(accounts) != 2 {
+		t.Fatalf("expected two distinct OIDC credentials, got %+v", accounts)
+	}
+	requestMu.Lock()
+	defer requestMu.Unlock()
+	if requestCount != 2 {
+		t.Fatalf("expected one upstream request per credential, got %d", requestCount)
 	}
 }
 
@@ -345,6 +404,6 @@ func TestConcurrentUsageRefreshesAndPersistsOnce(t *testing.T) {
 func resetUsageState() {
 	usageState.Lock()
 	usageState.cache = make(map[string]usageCacheEntry)
-	usageState.lastForced = make(map[string]time.Time)
+	usageState.lastRefresh = make(map[string]time.Time)
 	usageState.Unlock()
 }
