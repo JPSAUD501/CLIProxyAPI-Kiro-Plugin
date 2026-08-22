@@ -314,7 +314,7 @@ func TestToolResultsAtEndOfConversation(t *testing.T) {
 // then the next message is assistant
 func TestToolResultsFollowedByAssistant(t *testing.T) {
 	// Sequence: user -> assistant (with tool_calls) -> tool -> tool -> assistant -> user
-	// This simulates LiteLLM's translation of:
+	// Equivalent request after an OpenAI compatibility translation:
 	//   user: "Read files"
 	//   assistant: [tool_use, tool_use]
 	//   user: [tool_result, tool_result]  <- becomes multiple "tool" role messages
@@ -397,31 +397,5 @@ func TestToolResultsFollowedByAssistant(t *testing.T) {
 
 	if totalToolResults != 2 {
 		t.Errorf("Expected 2 tool results total, got %d", totalToolResults)
-	}
-}
-
-// TestAssistantEndsConversation verifies handling when assistant is the last message
-func TestAssistantEndsConversation(t *testing.T) {
-	input := []byte(`{
-		"model": "claude-opus-5",
-		"messages": [
-			{"role": "user", "content": "Hello"},
-			{
-				"role": "assistant",
-				"content": "Hi there!"
-			}
-		]
-	}`)
-
-	result, _ := BuildKiroPayloadFromOpenAI(input, "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
-
-	var payload KiroPayload
-	if err := json.Unmarshal(result, &payload); err != nil {
-		t.Fatalf("Failed to unmarshal result: %v", err)
-	}
-
-	// When assistant is last, a "Continue" user message should be created
-	if payload.ConversationState.CurrentMessage.UserInputMessage.Content == "" {
-		t.Error("Expected a 'Continue' message to be created when assistant is last")
 	}
 }

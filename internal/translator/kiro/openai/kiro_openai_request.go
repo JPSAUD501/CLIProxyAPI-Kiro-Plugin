@@ -5,9 +5,7 @@ package openai
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
@@ -138,28 +136,6 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 	// Extract system prompt from messages
 	systemPrompt := extractSystemPromptFromOpenAI(messages)
 
-	// Handle tool_choice parameter - Kiro doesn't support it natively, so we inject system prompt hints
-	// OpenAI tool_choice values: "none", "auto", "required", or {"type":"function","function":{"name":"..."}}
-	toolChoiceHint := extractToolChoiceHint(openaiBody)
-	if toolChoiceHint != "" {
-		if systemPrompt != "" {
-			systemPrompt += "\n"
-		}
-		systemPrompt += toolChoiceHint
-		log.Debugf("kiro-openai: injected tool_choice hint into system prompt")
-	}
-
-	// Handle response_format parameter - Kiro doesn't support it natively, so we inject system prompt hints
-	// OpenAI response_format: {"type": "json_object"} or {"type": "json_schema", "json_schema": {...}}
-	responseFormatHint := extractResponseFormatHint(openaiBody)
-	if responseFormatHint != "" {
-		if systemPrompt != "" {
-			systemPrompt += "\n"
-		}
-		systemPrompt += responseFormatHint
-		log.Debugf("kiro-openai: injected response_format hint into system prompt")
-	}
-
 	thinkingEnabled := effort != "" && effort != "none"
 
 	// Convert OpenAI tools to Kiro format
@@ -167,18 +143,9 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processOpenAIMessages(messages, modelID, origin)
-	if len(kiroTools) == 0 {
-		clearOpenAIToolState(history)
-		currentToolResults = nil
-	}
 
 	// Build content with system prompt
 	if currentUserMsg != nil {
-		currentUserMsg.Content = buildFinalContent(currentUserMsg.Content, "", currentToolResults)
-
-		// Deduplicate currentToolResults
-		currentToolResults = deduplicateToolResults(currentToolResults)
-
 		// Build userInputMessageContext with tools and tool results
 		if len(kiroTools) > 0 || len(currentToolResults) > 0 {
 			currentUserMsg.UserInputMessageContext = &KiroUserInputMessageContext{
@@ -194,12 +161,15 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 		currentMessage = KiroCurrentMessage{UserInputMessage: *currentUserMsg}
 	} else {
 		currentMessage = KiroCurrentMessage{UserInputMessage: KiroUserInputMessage{
-			Content: "Continue",
 			ModelID: modelID,
 			Origin:  origin,
 		}}
 	}
 
+	maxTokens := gjson.GetBytes(openaiBody, "max_completion_tokens").Int()
+	if maxTokens <= 0 {
+		maxTokens = gjson.GetBytes(openaiBody, "max_tokens").Int()
+	}
 	payload := KiroPayload{
 		ConversationState: KiroConversationState{
 			ChatTriggerType: "MANUAL",
@@ -208,7 +178,7 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 			History:         history,
 		},
 		ProfileArn:                   profileArn,
-		AdditionalModelRequestFields: capability.AdditionalFields(effort),
+		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, maxTokens),
 		SystemPrompt:                 systemPrompt,
 	}
 
@@ -219,20 +189,6 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 	}
 
 	return result, thinkingEnabled
-}
-
-func clearOpenAIToolState(history []KiroHistoryMessage) {
-	for i := range history {
-		if assistant := history[i].AssistantResponseMessage; assistant != nil {
-			assistant.ToolUses = nil
-		}
-		if user := history[i].UserInputMessage; user != nil && user.UserInputMessageContext != nil {
-			user.UserInputMessageContext.ToolResults = nil
-			if len(user.UserInputMessageContext.Tools) == 0 {
-				user.UserInputMessageContext = nil
-			}
-		}
-	}
 }
 
 // normalizeOrigin normalizes origin value for Kiro API compatibility
@@ -277,38 +233,6 @@ func extractSystemPromptFromOpenAI(messages gjson.Result) string {
 	return strings.Join(systemParts, "\n")
 }
 
-// shortenToolNameIfNeeded shortens tool names that exceed 64 characters.
-// MCP tools often have long names like "mcp__server-name__tool-name".
-// This preserves the "mcp__" prefix and last segment when possible.
-func shortenToolNameIfNeeded(name string) string {
-	const limit = 64
-	if len(name) <= limit {
-		return name
-	}
-	// For MCP tools, try to preserve prefix and last segment
-	if strings.HasPrefix(name, "mcp__") {
-		idx := strings.LastIndex(name, "__")
-		if idx > 0 {
-			cand := "mcp__" + name[idx+2:]
-			if len(cand) > limit {
-				return cand[:limit]
-			}
-			return cand
-		}
-	}
-	return name[:limit]
-}
-
-func ensureKiroInputSchema(parameters interface{}) interface{} {
-	if parameters != nil {
-		return parameters
-	}
-	return map[string]interface{}{
-		"type":       "object",
-		"properties": map[string]interface{}{},
-	}
-}
-
 // convertOpenAIToolsToKiro converts OpenAI tools to Kiro format
 func convertOpenAIToolsToKiro(tools gjson.Result) []KiroToolWrapper {
 	var kiroTools []KiroToolWrapper
@@ -334,30 +258,6 @@ func convertOpenAIToolsToKiro(tools gjson.Result) []KiroToolWrapper {
 		if parametersResult.Exists() && parametersResult.Type != gjson.Null {
 			parameters = parametersResult.Value()
 		}
-		parameters = ensureKiroInputSchema(parameters)
-
-		// Shorten tool name if it exceeds 64 characters (common with MCP tools)
-		originalName := name
-		name = shortenToolNameIfNeeded(name)
-		if name != originalName {
-			log.Debugf("kiro-openai: shortened tool name from '%s' to '%s'", originalName, name)
-		}
-
-		// CRITICAL FIX: Kiro API requires non-empty description
-		if strings.TrimSpace(description) == "" {
-			description = fmt.Sprintf("Tool: %s", name)
-			log.Debugf("kiro-openai: tool '%s' has empty description, using default: %s", name, description)
-		}
-
-		// Truncate long descriptions
-		if len(description) > kirocommon.KiroMaxToolDescLen {
-			truncLen := kirocommon.KiroMaxToolDescLen - 30
-			for truncLen > 0 && !utf8.RuneStart(description[truncLen]) {
-				truncLen--
-			}
-			description = description[:truncLen] + "... (description truncated)"
-		}
-
 		kiroTools = append(kiroTools, KiroToolWrapper{
 			ToolSpecification: KiroToolSpecification{
 				Name:        name,
@@ -407,14 +307,6 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 				currentUserMsg = &userMsg
 				currentToolResults = toolResults
 			} else {
-				// CRITICAL: Kiro API requires content to be non-empty for history messages
-				if strings.TrimSpace(userMsg.Content) == "" {
-					if len(toolResults) > 0 {
-						userMsg.Content = "Tool results provided."
-					} else {
-						userMsg.Content = "Continue"
-					}
-				}
 				// For history messages, embed tool results in context
 				if len(toolResults) > 0 {
 					userMsg.UserInputMessageContext = &KiroUserInputMessageContext{
@@ -428,12 +320,11 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 
 		case "assistant":
 			assistantMsg := buildAssistantMessageFromOpenAI(msg)
-
 			// If there are pending tool results, we need to insert a synthetic user message
 			// before this assistant message to maintain proper conversation structure
 			if len(pendingToolResults) > 0 {
 				syntheticUserMsg := KiroUserInputMessage{
-					Content: "Tool results provided.",
+					Content: "",
 					ModelID: modelID,
 					Origin:  origin,
 					UserInputMessageContext: &KiroUserInputMessageContext{
@@ -450,9 +341,7 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 				history = append(history, KiroHistoryMessage{
 					AssistantResponseMessage: &assistantMsg,
 				})
-				// Create a "Continue" user message as currentMessage
 				currentUserMsg = &KiroUserInputMessage{
-					Content: "Continue",
 					ModelID: modelID,
 					Origin:  origin,
 				}
@@ -487,144 +376,14 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 		// If there's no current user message, create a synthetic one for the tool results
 		if currentUserMsg == nil {
 			currentUserMsg = &KiroUserInputMessage{
-				Content: "Tool results provided.",
+				Content: "",
 				ModelID: modelID,
 				Origin:  origin,
 			}
 		}
 	}
 
-	history, currentToolResults = sanitizeKiroHistory(history, currentToolResults)
-
 	return history, currentUserMsg, currentToolResults
-}
-
-const kiroMaxHistoryMessages = 50
-
-func truncateHistoryIfNeeded(history []KiroHistoryMessage) []KiroHistoryMessage {
-	if len(history) <= kiroMaxHistoryMessages {
-		return history
-	}
-
-	start := len(history) - kiroMaxHistoryMessages
-	if start%2 != 0 {
-		start++
-	}
-	log.Debugf("kiro-openai: truncating history from %d to %d complete messages", len(history), len(history)-start)
-	return history[start:]
-}
-
-// sanitizeKiroHistory enforces the conversation contract accepted by Kiro:
-// history starts with user, alternates roles, ends with assistant, and every
-// tool result belongs to the immediately preceding assistant tool use.
-func sanitizeKiroHistory(history []KiroHistoryMessage, currentResults []KiroToolResult) ([]KiroHistoryMessage, []KiroToolResult) {
-	clean := make([]KiroHistoryMessage, 0, len(history))
-	expectUser := true
-	for _, message := range history {
-		if expectUser {
-			if message.UserInputMessage == nil || message.AssistantResponseMessage != nil {
-				continue
-			}
-			clean = append(clean, message)
-			expectUser = false
-			continue
-		}
-		if message.AssistantResponseMessage == nil || message.UserInputMessage != nil {
-			continue
-		}
-		clean = append(clean, message)
-		expectUser = true
-	}
-	if len(clean)%2 != 0 {
-		clean = clean[:len(clean)-1]
-	}
-	clean = truncateHistoryIfNeeded(clean)
-
-	for i := 1; i < len(clean); i += 2 {
-		assistant := clean[i].AssistantResponseMessage
-		if assistant == nil {
-			continue
-		}
-		var results []KiroToolResult
-		if i+1 < len(clean) {
-			results = toolResultsFromOpenAIUser(clean[i+1].UserInputMessage)
-		} else {
-			results = currentResults
-		}
-		resultIDs := make(map[string]struct{}, len(results))
-		for _, result := range results {
-			if result.ToolUseID != "" {
-				resultIDs[result.ToolUseID] = struct{}{}
-			}
-		}
-		seen := make(map[string]struct{}, len(assistant.ToolUses))
-		toolUses := assistant.ToolUses[:0]
-		for _, toolUse := range assistant.ToolUses {
-			if toolUse.ToolUseID == "" || strings.TrimSpace(toolUse.Name) == "" {
-				continue
-			}
-			if _, duplicate := seen[toolUse.ToolUseID]; duplicate {
-				continue
-			}
-			if _, matched := resultIDs[toolUse.ToolUseID]; !matched {
-				continue
-			}
-			seen[toolUse.ToolUseID] = struct{}{}
-			toolUses = append(toolUses, toolUse)
-		}
-		assistant.ToolUses = toolUses
-	}
-
-	var previousToolUses map[string]struct{}
-	for i := range clean {
-		if assistant := clean[i].AssistantResponseMessage; assistant != nil {
-			previousToolUses = make(map[string]struct{}, len(assistant.ToolUses))
-			for _, toolUse := range assistant.ToolUses {
-				previousToolUses[toolUse.ToolUseID] = struct{}{}
-			}
-			continue
-		}
-		filterOpenAIUserToolResults(clean[i].UserInputMessage, previousToolUses)
-		previousToolUses = nil
-	}
-	currentResults = filterOpenAIToolResults(currentResults, previousToolUses)
-	return clean, currentResults
-}
-
-func toolResultsFromOpenAIUser(user *KiroUserInputMessage) []KiroToolResult {
-	if user == nil || user.UserInputMessageContext == nil {
-		return nil
-	}
-	return user.UserInputMessageContext.ToolResults
-}
-
-func filterOpenAIUserToolResults(user *KiroUserInputMessage, allowed map[string]struct{}) {
-	if user == nil || user.UserInputMessageContext == nil {
-		return
-	}
-	user.UserInputMessageContext.ToolResults = filterOpenAIToolResults(user.UserInputMessageContext.ToolResults, allowed)
-	if len(user.UserInputMessageContext.ToolResults) == 0 && len(user.UserInputMessageContext.Tools) == 0 {
-		user.UserInputMessageContext = nil
-	}
-}
-
-func filterOpenAIToolResults(results []KiroToolResult, allowed map[string]struct{}) []KiroToolResult {
-	filtered := make([]KiroToolResult, 0, len(results))
-	seen := make(map[string]struct{}, len(results))
-	for _, result := range results {
-		if result.ToolUseID == "" {
-			continue
-		}
-		if _, ok := allowed[result.ToolUseID]; !ok {
-			continue
-		}
-		if _, duplicate := seen[result.ToolUseID]; duplicate {
-			continue
-		}
-		seen[result.ToolUseID] = struct{}{}
-		filtered = append(filtered, result)
-	}
-	return filtered
 }
 
 // buildUserMessageFromOpenAI builds a user message from OpenAI format and extracts tool results
@@ -735,10 +494,7 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 			toolArgs := tc.Get("function.arguments").String()
 
 			var inputMap map[string]interface{}
-			if err := json.Unmarshal([]byte(toolArgs), &inputMap); err != nil {
-				log.Debugf("kiro-openai: failed to parse tool arguments: %v", err)
-				inputMap = make(map[string]interface{})
-			}
+			_ = json.Unmarshal([]byte(toolArgs), &inputMap)
 
 			toolUses = append(toolUses, KiroToolUse{
 				ToolUseID: toolUseID,
@@ -748,140 +504,12 @@ func buildAssistantMessageFromOpenAI(msg gjson.Result) KiroAssistantResponseMess
 		}
 	}
 
-	// CRITICAL FIX: Kiro API requires non-empty content for assistant messages
-	// This can happen with compaction requests or error recovery scenarios
+	// Kiro requires the content field, but its official client uses an empty
+	// string for assistant turns that contain only tool calls.
 	finalContent := contentBuilder.String()
-	if strings.TrimSpace(finalContent) == "" {
-		if len(toolUses) > 0 {
-			finalContent = kirocommon.DefaultAssistantContentWithTools
-		} else {
-			finalContent = kirocommon.DefaultAssistantContent
-		}
-		log.Debugf("kiro-openai: assistant content was empty, using default: %s", finalContent)
-	}
 
 	return KiroAssistantResponseMessage{
 		Content:  finalContent,
 		ToolUses: toolUses,
 	}
-}
-
-// buildFinalContent builds the final content with system prompt
-func buildFinalContent(content, systemPrompt string, toolResults []KiroToolResult) string {
-	var contentBuilder strings.Builder
-
-	if systemPrompt != "" {
-		contentBuilder.WriteString("--- SYSTEM PROMPT ---\n")
-		contentBuilder.WriteString(systemPrompt)
-		contentBuilder.WriteString("\n--- END SYSTEM PROMPT ---\n\n")
-	}
-
-	contentBuilder.WriteString(content)
-	finalContent := contentBuilder.String()
-
-	// CRITICAL: Kiro API requires content to be non-empty
-	if strings.TrimSpace(finalContent) == "" {
-		if len(toolResults) > 0 {
-			finalContent = "Tool results provided."
-		} else {
-			finalContent = "Continue"
-		}
-		log.Debugf("kiro-openai: content was empty, using default: %s", finalContent)
-	}
-
-	return finalContent
-}
-
-// extractToolChoiceHint extracts tool_choice from OpenAI request and returns a system prompt hint.
-// OpenAI tool_choice values:
-// - "none": Don't use any tools
-// - "auto": Model decides (default, no hint needed)
-// - "required": Must use at least one tool
-// - {"type":"function","function":{"name":"..."}} : Must use specific tool
-func extractToolChoiceHint(openaiBody []byte) string {
-	toolChoice := gjson.GetBytes(openaiBody, "tool_choice")
-	if !toolChoice.Exists() {
-		return ""
-	}
-
-	// Handle string values
-	if toolChoice.Type == gjson.String {
-		switch toolChoice.String() {
-		case "none":
-			// Note: When tool_choice is "none", we should ideally not pass tools at all
-			// But since we can't modify tool passing here, we add a strong hint
-			return "[INSTRUCTION: Do NOT use any tools. Respond with text only.]"
-		case "required":
-			return "[INSTRUCTION: You MUST use at least one of the available tools to respond. Do not respond with text only - always make a tool call.]"
-		case "auto":
-			// Default behavior, no hint needed
-			return ""
-		}
-	}
-
-	// Handle object value: {"type":"function","function":{"name":"..."}}
-	if toolChoice.IsObject() {
-		if toolChoice.Get("type").String() == "function" {
-			toolName := toolChoice.Get("function.name").String()
-			if toolName != "" {
-				return fmt.Sprintf("[INSTRUCTION: You MUST use the tool named '%s' to respond. Do not use any other tool or respond with text only.]", toolName)
-			}
-		}
-	}
-
-	return ""
-}
-
-// extractResponseFormatHint extracts response_format from OpenAI request and returns a system prompt hint.
-// OpenAI response_format values:
-// - {"type": "text"}: Default, no hint needed
-// - {"type": "json_object"}: Must respond with valid JSON
-// - {"type": "json_schema", "json_schema": {...}}: Must respond with JSON matching schema
-func extractResponseFormatHint(openaiBody []byte) string {
-	responseFormat := gjson.GetBytes(openaiBody, "response_format")
-	if !responseFormat.Exists() {
-		return ""
-	}
-
-	formatType := responseFormat.Get("type").String()
-	switch formatType {
-	case "json_object":
-		return "[INSTRUCTION: You MUST respond with valid JSON only. Do not include any text before or after the JSON. Do not wrap the JSON in markdown code blocks. Output raw JSON directly.]"
-	case "json_schema":
-		// Extract schema if provided
-		schema := responseFormat.Get("json_schema.schema")
-		if schema.Exists() {
-			schemaStr := schema.Raw
-			// Truncate if too long
-			if len(schemaStr) > 500 {
-				schemaStr = schemaStr[:500] + "..."
-			}
-			return fmt.Sprintf("[INSTRUCTION: You MUST respond with valid JSON that matches this schema: %s. Do not include any text before or after the JSON. Do not wrap the JSON in markdown code blocks. Output raw JSON directly.]", schemaStr)
-		}
-		return "[INSTRUCTION: You MUST respond with valid JSON only. Do not include any text before or after the JSON. Do not wrap the JSON in markdown code blocks. Output raw JSON directly.]"
-	case "text":
-		// Default behavior, no hint needed
-		return ""
-	}
-
-	return ""
-}
-
-// deduplicateToolResults removes duplicate tool results
-func deduplicateToolResults(toolResults []KiroToolResult) []KiroToolResult {
-	if len(toolResults) == 0 {
-		return toolResults
-	}
-
-	seenIDs := make(map[string]bool)
-	unique := make([]KiroToolResult, 0, len(toolResults))
-	for _, tr := range toolResults {
-		if !seenIDs[tr.ToolUseID] {
-			seenIDs[tr.ToolUseID] = true
-			unique = append(unique, tr)
-		} else {
-			log.Debugf("kiro-openai: skipping duplicate toolResult: %s", tr.ToolUseID)
-		}
-	}
-	return unique
 }

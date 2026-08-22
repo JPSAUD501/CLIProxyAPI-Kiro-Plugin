@@ -8,10 +8,8 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"strings"
 
-	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -257,120 +255,4 @@ func ParseClaudeEvent(rawEvent []byte) (eventType string, eventData []byte) {
 		}
 	}
 	return eventType, eventData
-}
-
-// ExtractThinkingFromContent parses content to extract thinking blocks.
-// Returns cleaned content (without thinking tags) and whether thinking was found.
-func ExtractThinkingFromContent(content string) (string, string, bool) {
-	if !strings.Contains(content, kirocommon.ThinkingStartTag) {
-		return content, "", false
-	}
-
-	var cleanedContent strings.Builder
-	var thinkingContent strings.Builder
-	hasThinking := false
-	remaining := content
-
-	for len(remaining) > 0 {
-		startIdx := strings.Index(remaining, kirocommon.ThinkingStartTag)
-		if startIdx == -1 {
-			cleanedContent.WriteString(remaining)
-			break
-		}
-
-		// Add content before thinking tag
-		cleanedContent.WriteString(remaining[:startIdx])
-
-		// Move past opening tag
-		remaining = remaining[startIdx+len(kirocommon.ThinkingStartTag):]
-
-		// Find closing tag
-		endIdx := strings.Index(remaining, kirocommon.ThinkingEndTag)
-		if endIdx == -1 {
-			// No closing tag - treat rest as thinking
-			thinkingContent.WriteString(remaining)
-			hasThinking = true
-			break
-		}
-
-		// Extract thinking content
-		thinkingContent.WriteString(remaining[:endIdx])
-		hasThinking = true
-		remaining = remaining[endIdx+len(kirocommon.ThinkingEndTag):]
-	}
-
-	return strings.TrimSpace(cleanedContent.String()), strings.TrimSpace(thinkingContent.String()), hasThinking
-}
-
-// ConvertOpenAIToolsToKiroFormat is a helper that converts OpenAI tools format to Kiro format
-func ConvertOpenAIToolsToKiroFormat(tools []map[string]interface{}) []KiroToolWrapper {
-	var kiroTools []KiroToolWrapper
-
-	for _, tool := range tools {
-		toolType, _ := tool["type"].(string)
-		if toolType != "function" {
-			continue
-		}
-
-		fn, ok := tool["function"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		name := kirocommon.GetString(fn, "name")
-		description := kirocommon.GetString(fn, "description")
-		parameters := ensureKiroInputSchema(fn["parameters"])
-
-		if name == "" {
-			continue
-		}
-
-		if description == "" {
-			description = "Tool: " + name
-		}
-
-		kiroTools = append(kiroTools, KiroToolWrapper{
-			ToolSpecification: KiroToolSpecification{
-				Name:        name,
-				Description: description,
-				InputSchema: KiroInputSchema{JSON: parameters},
-			},
-		})
-	}
-
-	return kiroTools
-}
-
-// OpenAIStreamParams holds parameters for OpenAI streaming conversion
-type OpenAIStreamParams struct {
-	State            *OpenAIStreamState
-	ThinkingState    *ThinkingTagState
-	ToolCallsEmitted map[string]bool
-}
-
-// NewOpenAIStreamParams creates new streaming parameters
-func NewOpenAIStreamParams(model string) *OpenAIStreamParams {
-	return &OpenAIStreamParams{
-		State:            NewOpenAIStreamState(model),
-		ThinkingState:    NewThinkingTagState(),
-		ToolCallsEmitted: make(map[string]bool),
-	}
-}
-
-// ConvertClaudeToolUseToOpenAI converts a Claude tool_use block to OpenAI tool_calls format
-func ConvertClaudeToolUseToOpenAI(toolUseID, toolName string, input map[string]interface{}) map[string]interface{} {
-	inputJSON, _ := json.Marshal(input)
-	return map[string]interface{}{
-		"id":   toolUseID,
-		"type": "function",
-		"function": map[string]interface{}{
-			"name":      toolName,
-			"arguments": string(inputJSON),
-		},
-	}
-}
-
-// LogStreamEvent logs a streaming event for debugging
-func LogStreamEvent(eventType, data string) {
-	log.Debugf("kiro-openai: stream event type=%s, data_len=%d", eventType, len(data))
 }

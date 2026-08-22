@@ -6,6 +6,7 @@ import (
 	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
 func TestMapModelToKiroNeverSubstitutesAnotherModel(t *testing.T) {
@@ -20,6 +21,21 @@ func TestMapModelToKiroNeverSubstitutesAnotherModel(t *testing.T) {
 		if got := executor.mapModelToKiro(input); got != want {
 			t.Errorf("mapModelToKiro(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestPrepareModelCapabilityRejectsOutOfRangeMaxTokens(t *testing.T) {
+	auth := &cliproxyauth.Auth{ID: "auth-max-tokens-test"}
+	modelcapabilities.ReplaceForAuth(auth.ID, []modelcapabilities.Capability{{
+		ModelID: "claude-opus-5", SupportsMaxTokens: true,
+		MinimumOutputTokens: 1024, MaximumOutputTokens: 128000,
+	}})
+	opts := cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("openai-response"),
+		OriginalRequest: []byte(`{"max_output_tokens":512}`),
+	}
+	if err := prepareModelCapability(auth, "claude-opus-5", &opts); err == nil {
+		t.Fatal("expected an out-of-range max_output_tokens error")
 	}
 }
 

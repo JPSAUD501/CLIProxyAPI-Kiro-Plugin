@@ -6,6 +6,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -97,7 +98,8 @@ func BuildOpenAIResponseWithReasoning(content, reasoningContent string, toolUses
 
 // mapKiroStopReasonToOpenAI converts Kiro/Claude stop_reason to OpenAI finish_reason
 func mapKiroStopReasonToOpenAI(stopReason string) string {
-	switch stopReason {
+	normalized := strings.ToLower(strings.TrimSpace(stopReason))
+	switch normalized {
 	case "end_turn":
 		return "stop"
 	case "stop_sequence":
@@ -109,7 +111,7 @@ func mapKiroStopReasonToOpenAI(stopReason string) string {
 	case "content_filtered":
 		return "content_filter"
 	default:
-		return stopReason
+		return normalized
 	}
 }
 

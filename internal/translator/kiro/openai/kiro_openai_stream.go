@@ -151,14 +151,6 @@ func BuildOpenAISSEUsage(state *OpenAIStreamState, usageInfo usage.Detail) strin
 	return FormatSSEEvent(result)
 }
 
-// BuildOpenAISSEDone creates the final [DONE] SSE event.
-// Note: This returns raw "[DONE]" without "data:" prefix.
-// The SSE "data:" prefix is added by the Handler layer (e.g., openai_handlers.go)
-// to maintain architectural consistency and avoid double-prefix issues.
-func BuildOpenAISSEDone() string {
-	return "[DONE]"
-}
-
 // buildBaseChunk creates a base chunk structure for streaming
 func buildBaseChunk(state *OpenAIStreamState, delta map[string]interface{}, finishReason *string) map[string]interface{} {
 	choice := map[string]interface{}{
@@ -212,20 +204,4 @@ func BuildOpenAISSEFirstChunk(state *OpenAIStreamState) string {
 	result, _ := json.Marshal(chunk)
 	state.ChunkIndex++
 	return FormatSSEEvent(result)
-}
-
-// ThinkingTagState tracks state for thinking tag detection in streaming
-type ThinkingTagState struct {
-	InThinkingBlock   bool
-	PendingStartChars int
-	PendingEndChars   int
-}
-
-// NewThinkingTagState creates a new thinking tag state
-func NewThinkingTagState() *ThinkingTagState {
-	return &ThinkingTagState{
-		InThinkingBlock:   false,
-		PendingStartChars: 0,
-		PendingEndChars:   0,
-	}
 }

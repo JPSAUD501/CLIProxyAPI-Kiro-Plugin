@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.5.1"
+	pluginVersion     = "0.5.2"
 	maxPages          = 10
 )
 
@@ -526,6 +526,7 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		}
 		id := normalizeModelID(model.ModelID)
 		capability := modelcapabilities.Parse(id, model.AdditionalModelRequestFieldsSchema)
+		capability.InputTokenLimit = int64(model.TokenLimits.MaxInputTokens)
 		capabilities = append(capabilities, capability)
 		out = append(out, pluginapi.ModelInfo{
 			ID: id, Object: "model", OwnedBy: providerName, Type: providerName,

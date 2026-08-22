@@ -31,8 +31,8 @@ func TestBuildKiroPayloadUsesOfficialSystemPromptAndCompleteHistory(t *testing.T
 	if payload.SystemPrompt == "" || payload.ConversationState.CurrentMessage.UserInputMessage.Content != "latest" {
 		t.Fatalf("system prompt or current message was not mapped: %#v", payload)
 	}
-	if len(payload.ConversationState.History) != kiroMaxHistoryMessages {
-		t.Fatalf("history length = %d, want %d", len(payload.ConversationState.History), kiroMaxHistoryMessages)
+	if len(payload.ConversationState.History) != 60 {
+		t.Fatalf("history length = %d, want all 60 messages", len(payload.ConversationState.History))
 	}
 	for i, message := range payload.ConversationState.History {
 		if i%2 == 0 && message.UserInputMessage == nil {
@@ -41,24 +41,5 @@ func TestBuildKiroPayloadUsesOfficialSystemPromptAndCompleteHistory(t *testing.T
 		if i%2 == 1 && message.AssistantResponseMessage == nil {
 			t.Fatalf("history[%d] must be an assistant message", i)
 		}
-	}
-}
-
-func TestSanitizeKiroHistoryKeepsOnlyAdjacentToolPairs(t *testing.T) {
-	history := []KiroHistoryMessage{
-		{UserInputMessage: &KiroUserInputMessage{Content: "run"}},
-		{AssistantResponseMessage: &KiroAssistantResponseMessage{Content: "calling", ToolUses: []KiroToolUse{
-			{ToolUseID: "matched", Name: "read"},
-			{ToolUseID: "missing-result", Name: "write"},
-		}}},
-	}
-	results := []KiroToolResult{{ToolUseID: "matched"}, {ToolUseID: "orphan"}}
-
-	clean, current := sanitizeKiroHistory(history, results)
-	if got := len(clean[1].AssistantResponseMessage.ToolUses); got != 1 {
-		t.Fatalf("tool uses = %d, want 1", got)
-	}
-	if got := len(current); got != 1 || current[0].ToolUseID != "matched" {
-		t.Fatalf("current tool results = %#v", current)
 	}
 }

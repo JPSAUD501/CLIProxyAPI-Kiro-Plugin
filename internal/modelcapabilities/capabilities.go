@@ -15,10 +15,14 @@ const (
 )
 
 type Capability struct {
-	ModelID       string     `json:"model_id"`
-	EffortPath    EffortPath `json:"effort_path,omitempty"`
-	EffortLevels  []string   `json:"effort_levels,omitempty"`
-	DefaultEffort string     `json:"default_effort,omitempty"`
+	ModelID             string     `json:"model_id"`
+	EffortPath          EffortPath `json:"effort_path,omitempty"`
+	EffortLevels        []string   `json:"effort_levels,omitempty"`
+	DefaultEffort       string     `json:"default_effort,omitempty"`
+	InputTokenLimit     int64      `json:"input_token_limit,omitempty"`
+	SupportsMaxTokens   bool       `json:"supports_max_tokens,omitempty"`
+	MinimumOutputTokens int64      `json:"minimum_output_tokens,omitempty"`
+	MaximumOutputTokens int64      `json:"maximum_output_tokens,omitempty"`
 }
 
 func (c Capability) SupportsEffort(effort string) bool {
@@ -40,6 +44,18 @@ func (c Capability) AdditionalFields(effort string) map[string]any {
 		return nil
 	}
 	return map[string]any{string(c.EffortPath): map[string]any{"effort": effort}}
+}
+
+func (c Capability) AdditionalFieldsForRequest(effort string, maxTokens int64) map[string]any {
+	fields := c.AdditionalFields(effort)
+	if !c.SupportsMaxTokens || maxTokens <= 0 {
+		return fields
+	}
+	if fields == nil {
+		fields = make(map[string]any)
+	}
+	fields["max_tokens"] = maxTokens
+	return fields
 }
 
 func Parse(modelID string, schema json.RawMessage) Capability {
@@ -68,9 +84,27 @@ func Parse(modelID string, schema json.RawMessage) Capability {
 		if value, ok := effort["default"].(string); ok && capability.SupportsEffort(value) {
 			capability.DefaultEffort = strings.ToLower(strings.TrimSpace(value))
 		}
-		return capability
+		break
+	}
+	if maxTokens, ok := nestedObject(root, "properties", "max_tokens"); ok {
+		capability.SupportsMaxTokens = true
+		capability.MinimumOutputTokens = integerValue(maxTokens["minimum"])
+		capability.MaximumOutputTokens = integerValue(maxTokens["maximum"])
 	}
 	return capability
+}
+
+func integerValue(value any) int64 {
+	switch number := value.(type) {
+	case float64:
+		return int64(number)
+	case int64:
+		return number
+	case int:
+		return int64(number)
+	default:
+		return 0
+	}
 }
 
 func nestedObject(root map[string]any, path ...string) (map[string]any, bool) {
@@ -163,6 +197,15 @@ func Snapshot() []Capability {
 				current.EffortLevels = nil
 				current.DefaultEffort = ""
 			}
+			current.InputTokenLimit = minimumPositive(current.InputTokenLimit, next.InputTokenLimit)
+			if !current.SupportsMaxTokens || !next.SupportsMaxTokens {
+				current.SupportsMaxTokens = false
+				current.MinimumOutputTokens = 0
+				current.MaximumOutputTokens = 0
+			} else {
+				current.MinimumOutputTokens = maximum(current.MinimumOutputTokens, next.MinimumOutputTokens)
+				current.MaximumOutputTokens = minimumPositive(current.MaximumOutputTokens, next.MaximumOutputTokens)
+			}
 			intersection[id] = current
 		}
 	}
@@ -171,6 +214,23 @@ func Snapshot() []Capability {
 		result = append(result, capability)
 	}
 	return result
+}
+
+func minimumPositive(left, right int64) int64 {
+	if left <= 0 {
+		return right
+	}
+	if right <= 0 || left < right {
+		return left
+	}
+	return right
+}
+
+func maximum(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func intersectLevels(left, right []string) []string {
