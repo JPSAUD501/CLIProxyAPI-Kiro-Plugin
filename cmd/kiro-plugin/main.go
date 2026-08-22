@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.5.0"
+	pluginVersion     = "0.5.1"
 	maxPages          = 10
 )
 
@@ -111,8 +111,10 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type registration struct {
@@ -179,7 +181,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, err := handleMethod(C.GoString(method), body)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
+		writeResponse(response, errorEnvelopeFromError(err))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -1018,6 +1020,23 @@ func okEnvelope(value any) ([]byte, error) {
 
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return raw
+}
+
+func errorEnvelopeFromError(err error) []byte {
+	if err == nil {
+		return errorEnvelope("plugin_error", "plugin call failed")
+	}
+	status := 0
+	if statusError, ok := err.(interface{ StatusCode() int }); ok {
+		status = statusError.StatusCode()
+	}
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       "plugin_error",
+		Message:    err.Error(),
+		Retryable:  status == http.StatusTooManyRequests || status >= http.StatusInternalServerError,
+		HTTPStatus: status,
+	}})
 	return raw
 }
 

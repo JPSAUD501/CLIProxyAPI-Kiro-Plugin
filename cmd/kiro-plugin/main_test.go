@@ -147,6 +147,22 @@ func TestPluginUsesKiroDisplayNameAndStableProviderID(t *testing.T) {
 	}
 }
 
+func TestErrorEnvelopePreservesHTTPStatus(t *testing.T) {
+	raw := errorEnvelopeFromError(requestStatusError{status: http.StatusBadRequest})
+	var decoded envelope
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Error == nil || decoded.Error.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("error envelope = %#v", decoded.Error)
+	}
+}
+
+type requestStatusError struct{ status int }
+
+func (e requestStatusError) Error() string   { return "invalid request" }
+func (e requestStatusError) StatusCode() int { return e.status }
+
 func TestNormalizeModelIDUsesUpstreamID(t *testing.T) {
 	tests := map[string]string{
 		"claude-sonnet-4.5": "claude-sonnet-4.5",
