@@ -21,6 +21,7 @@ import (
 	"time"
 
 	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
+	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 	kiroclaude "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/claude"
 	kirocommon "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/common"
 	kiroopenai "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/openai"
@@ -520,18 +521,21 @@ func isIDCAuth(auth *cliproxyauth.Auth) bool {
 // This is critical because OpenAI and Claude formats have different tool structures:
 // - OpenAI: tools[].function.name, tools[].function.description
 // - Claude: tools[].name, tools[].description
-// headers parameter allows checking Anthropic-Beta header for thinking mode detection.
-// Returns the serialized JSON payload and a boolean indicating whether thinking mode was injected.
-func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, sourceFormat sdktranslator.Format, headers http.Header) ([]byte, bool) {
+// Capability metadata selects the exact additionalModelRequestFields path.
+// The boolean reports whether reasoning events are expected.
+func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, sourceFormat sdktranslator.Format, metadata map[string]any) ([]byte, bool) {
+	authID, _ := metadata["_kiro_auth_id"].(string)
+	effort, _ := metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
+	capability, _ := modelcapabilities.ForAuth(authID, modelID)
 	switch sourceFormat.String() {
 	case "openai":
 		log.Debugf("kiro: using OpenAI payload builder for source format: %s", sourceFormat.String())
-		return kiroopenai.BuildKiroPayloadFromOpenAI(body, modelID, profileArn, origin, headers, nil)
+		return kiroopenai.BuildKiroPayloadFromOpenAI(body, modelID, profileArn, origin, capability, effort)
 	case "openai-response":
 		// The registered Responses request translator converts the request to
 		// Claude format before it reaches the executor.
 		log.Debugf("kiro: using Claude payload builder for Responses request")
-		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, headers, nil)
+		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, capability, effort)
 	case "kiro":
 		// Body is already in Kiro format — pass through directly
 		log.Debugf("kiro: body already in Kiro format, passing through directly")
@@ -539,8 +543,33 @@ func buildKiroPayloadForFormat(body []byte, modelID, profileArn, origin string, 
 	default:
 		// Default to Claude format
 		log.Debugf("kiro: using Claude payload builder for source format: %s", sourceFormat.String())
-		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, headers, nil)
+		return kiroclaude.BuildKiroPayload(body, modelID, profileArn, origin, capability, effort)
 	}
+}
+
+func prepareModelCapability(auth *cliproxyauth.Auth, modelID string, opts *cliproxyexecutor.Options) error {
+	if opts.Metadata == nil {
+		opts.Metadata = make(map[string]any)
+	}
+	authID := ""
+	if auth != nil {
+		authID = auth.ID
+	}
+	opts.Metadata["_kiro_auth_id"] = authID
+	effort, _ := opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey].(string)
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" {
+		return nil
+	}
+	capability, ok := modelcapabilities.ForAuth(authID, modelID)
+	if !ok {
+		return requestValidationErr{msg: fmt.Sprintf("Kiro capabilities are unavailable for model %q and the selected account", modelID)}
+	}
+	if !capability.SupportsEffort(effort) {
+		return requestValidationErr{msg: fmt.Sprintf("Kiro model %q does not support reasoning effort %q", modelID, effort)}
+	}
+	opts.Metadata[cliproxyexecutor.ReasoningEffortMetadataKey] = effort
+	return nil
 }
 
 // NewKiroExecutor creates a new Kiro executor instance.
@@ -697,6 +726,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
 	kiroModelID := e.mapModelToKiro(req.Model)
+	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+		return resp, err
+	}
 
 	// Determine the effective profile ARN for the selected credential.
 	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
@@ -729,7 +761,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 		// Rebuild payload with the correct origin for this endpoint
 		// Each endpoint requires its matching Origin value in the request body
-		kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+		kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 
 		log.Debugf("kiro: trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
@@ -895,7 +927,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					}
 					accessToken, profileArn = kiroCredentials(auth)
 					// Rebuild payload with new profile ARN if changed
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 					if attempt < maxRetries {
 						log.Infof("kiro: token refreshed successfully, retrying request (attempt %d/%d)", attempt+1, maxRetries+1)
 						continue
@@ -962,7 +994,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 							// Continue anyway - the token is valid for this request
 						}
 						accessToken, profileArn = kiroCredentials(auth)
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 						log.Infof("kiro: token refreshed for 403, retrying request")
 						continue
 					}
@@ -1129,6 +1161,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
 	kiroModelID := e.mapModelToKiro(req.Model)
+	if err := prepareModelCapability(auth, kiroModelID, &opts); err != nil {
+		return nil, err
+	}
 
 	// Determine the effective profile ARN for the selected credential.
 	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
@@ -1163,7 +1198,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 		// Rebuild payload with the correct origin for this endpoint
 		// Each endpoint requires its matching Origin value in the request body
-		kiroPayload, thinkingEnabled := buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+		kiroPayload, thinkingEnabled := buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 
 		log.Debugf("kiro: stream trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
@@ -1329,7 +1364,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					}
 					accessToken, profileArn = kiroCredentials(auth)
 					// Rebuild payload with new profile ARN if changed
-					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+					kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 					if attempt < maxRetries {
 						log.Infof("kiro: token refreshed successfully, retrying stream request (attempt %d/%d)", attempt+1, maxRetries+1)
 						continue
@@ -1396,7 +1431,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 							// Continue anyway - the token is valid for this request
 						}
 						accessToken, profileArn = kiroCredentials(auth)
-						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Headers)
+						kiroPayload, _ = buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, from, opts.Metadata)
 						log.Infof("kiro: token refreshed for 403, retrying stream request")
 						continue
 					}
@@ -1642,154 +1677,26 @@ func findRealThinkingEndTag(content string, alreadyInCodeBlock, alreadyInInlineC
 	}
 }
 
-// getEffectiveProfileArn determines if profileArn should be included based on auth method.
-// profileArn is only needed for social auth (Google OAuth), not for AWS SSO OIDC (Builder ID/IDC).
-//
-// Detection logic (matching kiro-openai-gateway):
-// 1. Check auth_method field: "builder-id" or "idc"
-// 2. Check auth_type field: "aws_sso_oidc" (from kiro-cli tokens)
-// 3. Check for client_id + client_secret presence (AWS SSO OIDC signature)
-func getEffectiveProfileArn(auth *cliproxyauth.Auth, profileArn string) string {
-	if auth != nil && auth.Metadata != nil {
-		// Check 1: auth_method field (from CLIProxyAPI tokens)
-		if authMethod, ok := auth.Metadata["auth_method"].(string); ok && (authMethod == "builder-id" || authMethod == "idc") {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-		// Check 2: auth_type field (from kiro-cli tokens)
-		if authType, ok := auth.Metadata["auth_type"].(string); ok && authType == "aws_sso_oidc" {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-		// Check 3: client_id + client_secret presence (AWS SSO OIDC signature)
-		_, hasClientID := auth.Metadata["client_id"].(string)
-		_, hasClientSecret := auth.Metadata["client_secret"].(string)
-		if hasClientID && hasClientSecret {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-	}
-	return profileArn
-}
-
-// getEffectiveProfileArnWithWarning determines if profileArn should be included based on auth method,
-// and logs a warning if profileArn is missing for non-builder-id auth.
-// This consolidates the auth_method check that was previously done separately.
-//
-// AWS SSO OIDC (Builder ID/IDC) users don't need profileArn - sending it causes 403 errors.
-// Only Kiro Desktop (social auth like Google/GitHub) users need profileArn.
-//
-// Detection logic (matching kiro-openai-gateway):
-// 1. Check auth_method field: "builder-id" or "idc"
-// 2. Check auth_type field: "aws_sso_oidc" (from kiro-cli tokens)
-// 3. Check for client_id + client_secret presence (AWS SSO OIDC signature)
-func getEffectiveProfileArnWithWarning(auth *cliproxyauth.Auth, profileArn string) string {
-	if auth != nil && auth.Metadata != nil {
-		// Check 1: auth_method field (from CLIProxyAPI tokens)
-		if authMethod, ok := auth.Metadata["auth_method"].(string); ok && (authMethod == "builder-id" || authMethod == "idc") {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-		// Check 2: auth_type field (from kiro-cli tokens)
-		if authType, ok := auth.Metadata["auth_type"].(string); ok && authType == "aws_sso_oidc" {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-		// Check 3: client_id + client_secret presence (AWS SSO OIDC signature, like kiro-openai-gateway)
-		_, hasClientID := auth.Metadata["client_id"].(string)
-		_, hasClientSecret := auth.Metadata["client_secret"].(string)
-		if hasClientID && hasClientSecret {
-			return "" // AWS SSO OIDC - don't include profileArn
-		}
-	}
-	// For social auth (Kiro Desktop), profileArn is required
+// getEffectiveProfileArnWithWarning preserves the profile discovered with the
+// selected credential. Kiro uses it to select the subscription and model
+// entitlements, including for AWS IAM Identity Center sessions.
+func getEffectiveProfileArnWithWarning(_ *cliproxyauth.Auth, profileArn string) string {
+	profileArn = strings.TrimSpace(profileArn)
 	if profileArn == "" {
 		log.Warnf("kiro: profile ARN not found in auth, API calls may fail")
 	}
 	return profileArn
 }
 
-// mapModelToKiro maps external model names to Kiro model IDs.
-// Supports both Kiro and Amazon Q prefixes since they use the same API.
+// mapModelToKiro returns the exact model advertised by Kiro. The CLIProxyAPI
+// may append a thinking suffix for model selection; that suffix is transport
+// metadata and is not part of the upstream model ID.
 func (e *KiroExecutor) mapModelToKiro(model string) string {
-	modelMap := map[string]string{
-		// Amazon Q format (amazonq- prefix) - same API as Kiro
-		"amazonq-auto":                       "auto",
-		"amazonq-claude-opus-4-6":            "claude-opus-4.6",
-		"amazonq-claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"amazonq-claude-opus-4-5":            "claude-opus-4.5",
-		"amazonq-claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"amazonq-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"amazonq-claude-sonnet-4":            "claude-sonnet-4",
-		"amazonq-claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"amazonq-claude-haiku-4-5":           "claude-haiku-4.5",
-		// Kiro format (kiro- prefix) - valid model names that should be preserved
-		"kiro-claude-opus-4-6":            "claude-opus-4.6",
-		"kiro-claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"kiro-claude-opus-4-5":            "claude-opus-4.5",
-		"kiro-claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"kiro-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"kiro-claude-sonnet-4":            "claude-sonnet-4",
-		"kiro-claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"kiro-claude-haiku-4-5":           "claude-haiku-4.5",
-		"kiro-auto":                       "auto",
-		// Native format (no prefix) - used by Kiro IDE directly
-		"claude-opus-4-6":            "claude-opus-4.6",
-		"claude-opus-4.6":            "claude-opus-4.6",
-		"claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"claude-sonnet-4.6":          "claude-sonnet-4.6",
-		"claude-opus-4-5":            "claude-opus-4.5",
-		"claude-opus-4.5":            "claude-opus-4.5",
-		"claude-haiku-4-5":           "claude-haiku-4.5",
-		"claude-haiku-4.5":           "claude-haiku-4.5",
-		"claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"claude-sonnet-4.5":          "claude-sonnet-4.5",
-		"claude-sonnet-4":            "claude-sonnet-4",
-		"claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"auto":                       "auto",
+	model = strings.TrimSpace(model)
+	if open := strings.LastIndexByte(model, '('); open > 0 && strings.HasSuffix(model, ")") {
+		model = strings.TrimSpace(model[:open])
 	}
-	if kiroID, ok := modelMap[model]; ok {
-		return kiroID
-	}
-
-	// Smart fallback: try to infer model type from name patterns
-	modelLower := strings.ToLower(model)
-
-	// Check for Haiku variants
-	if strings.Contains(modelLower, "haiku") {
-		log.Debugf("kiro: unknown Haiku model '%s', mapping to claude-haiku-4.5", model)
-		return "claude-haiku-4.5"
-	}
-
-	// Check for Sonnet variants
-	if strings.Contains(modelLower, "sonnet") {
-		// Check for specific version patterns
-		if strings.Contains(modelLower, "3-7") || strings.Contains(modelLower, "3.7") {
-			log.Debugf("kiro: unknown Sonnet 3.7 model '%s', mapping to claude-3-7-sonnet-20250219", model)
-			return "claude-3-7-sonnet-20250219"
-		}
-		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
-			log.Debugf("kiro: unknown Sonnet 4.6 model '%s', mapping to claude-sonnet-4.6", model)
-			return "claude-sonnet-4.6"
-		}
-		if strings.Contains(modelLower, "4-5") || strings.Contains(modelLower, "4.5") {
-			log.Debugf("kiro: unknown Sonnet 4.5 model '%s', mapping to claude-sonnet-4.5", model)
-			return "claude-sonnet-4.5"
-		}
-		// Default to Sonnet 4
-		log.Debugf("kiro: unknown Sonnet model '%s', mapping to claude-sonnet-4", model)
-		return "claude-sonnet-4"
-	}
-
-	// Check for Opus variants
-	if strings.Contains(modelLower, "opus") {
-		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
-			log.Debugf("kiro: unknown Opus 4.6 model '%s', mapping to claude-opus-4.6", model)
-			return "claude-opus-4.6"
-		}
-		log.Debugf("kiro: unknown Opus model '%s', mapping to claude-opus-4.5", model)
-		return "claude-opus-4.5"
-	}
-
-	// Final fallback to Sonnet 4.5 (most commonly used model)
-	log.Warnf("kiro: unknown model '%s', falling back to claude-sonnet-4.5", model)
-	return "claude-sonnet-4.5"
+	return strings.TrimPrefix(model, "kiro/")
 }
 
 // EventStreamError represents an Event Stream processing error

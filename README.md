@@ -7,6 +7,7 @@ The plugin:
 - discovers the Kiro profile with the access token of each account;
 - keeps Identity Center registrations isolated;
 - loads only the models available to the authenticated account;
+- derives reasoning effort levels and the upstream field path from each model's live Kiro schema;
 - exposes upstream model IDs without a `kiro/` prefix;
 - supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages;
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
@@ -25,7 +26,8 @@ The plugin:
 ## Build
 
 ```powershell
-go test ./cmd/kiro-plugin
+go test ./...
+go vet ./...
 New-Item -ItemType Directory -Force dist | Out-Null
 go build -trimpath -buildmode=c-shared -o dist/kiro.dll ./cmd/kiro-plugin
 $hash = (Get-FileHash dist/kiro.dll -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -52,6 +54,12 @@ plugins:
 Restart CLIProxyAPI and open the Kiro login action in the Management Center. Enter the AWS IAM Identity Center Start URL and region for that account. The form does not provide default values.
 
 The plugin stores the resulting Identity Center session through the CLIProxyAPI authentication mechanism. Do not put passwords, management keys, access tokens, refresh tokens, or client secrets in the configuration or repository.
+
+## Model capabilities
+
+Reasoning controls are advertised only when the authenticated account's Kiro model schema declares an `effort` enum. Claude models currently use `additionalModelRequestFields.output_config.effort`; GPT models use `additionalModelRequestFields.reasoning.effort`. The plugin forwards the selected level through that declared path for OpenAI Responses, Chat Completions, and Anthropic Messages.
+
+The loopback resource `/v0/resource/plugins/kiro/capabilities` exposes only the intersection of non-secret model capability metadata discovered for the connected accounts. Local catalog synchronizers can use it instead of maintaining guessed model lists. It contains no account identifiers, profile ARNs, tokens, or quota data.
 
 ## Kiro Usage
 

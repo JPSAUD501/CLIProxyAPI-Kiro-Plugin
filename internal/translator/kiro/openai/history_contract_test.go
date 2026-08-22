@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+
+	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 )
 
 func TestBuildKiroPayloadUsesOfficialSystemPromptAndCompleteHistory(t *testing.T) {
@@ -21,7 +23,7 @@ func TestBuildKiroPayloadUsesOfficialSystemPromptAndCompleteHistory(t *testing.T
 		t.Fatal(err)
 	}
 
-	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", nil, nil)
+	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
 	var payload KiroPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("invalid payload: %v", err)

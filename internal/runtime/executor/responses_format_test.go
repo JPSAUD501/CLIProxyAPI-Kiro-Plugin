@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"net/http"
 	"testing"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -25,7 +24,7 @@ func TestResponsesRequestBuildsValidKiroPayload(t *testing.T) {
 		"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
 		"AI_EDITOR",
 		sdktranslator.FormatOpenAIResponse,
-		http.Header{},
+		nil,
 	)
 
 	parsed := gjson.ParseBytes(payload)

@@ -19,6 +19,12 @@ type statusErr struct {
 	retryAfter *time.Duration
 }
 
+type requestValidationErr struct{ msg string }
+
+func (e requestValidationErr) Error() string         { return e.msg }
+func (e requestValidationErr) IsRequestScoped() bool { return true }
+func (e requestValidationErr) StatusCode() int       { return http.StatusBadRequest }
+
 func (e statusErr) Error() string              { return e.msg }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }

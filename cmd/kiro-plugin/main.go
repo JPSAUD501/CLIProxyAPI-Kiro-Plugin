@@ -52,12 +52,14 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
 	kiroauth "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/auth/kiro"
+	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 	kiroexecutor "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	coreexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -71,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.4.2"
+	pluginVersion     = "0.5.0"
 	maxPages          = 10
 )
 
@@ -227,6 +229,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Resources: []pluginapi.ResourceRoute{
 				{Path: "/login"},
 				{Path: "/begin"},
+				{Path: "/capabilities"},
 				{Path: usageResourcePath, Menu: "Kiro Usage", Description: "Shows Kiro subscription usage for connected accounts."},
 			},
 		})
@@ -514,20 +517,24 @@ func handleModelsForAuth(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("list Kiro models: %w", err)
 	}
 	out := make([]pluginapi.ModelInfo, 0, len(models))
+	capabilities := make([]modelcapabilities.Capability, 0, len(models))
 	for _, model := range models {
 		if strings.TrimSpace(model.ModelID) == "" {
 			continue
 		}
 		id := normalizeModelID(model.ModelID)
+		capability := modelcapabilities.Parse(id, model.AdditionalModelRequestFieldsSchema)
+		capabilities = append(capabilities, capability)
 		out = append(out, pluginapi.ModelInfo{
 			ID: id, Object: "model", OwnedBy: providerName, Type: providerName,
 			Name: model.ModelID, DisplayName: defaultString(model.ModelName, id), Description: model.Description,
 			InputTokenLimit: int64(model.TokenLimits.MaxInputTokens), OutputTokenLimit: int64(model.TokenLimits.MaxOutputTokens),
 			SupportedGenerationMethods: []string{"chat"}, SupportedInputModalities: model.SupportedInputTypes, SupportedOutputModalities: []string{"text"},
-			Thinking:    thinkingSupport(model.AdditionalModelRequestFieldsSchema),
+			Thinking:    thinkingSupport(capability),
 			UserDefined: true,
 		})
 	}
+	modelcapabilities.ReplaceForAuth(req.AuthID, capabilities)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: out})
 }
 
@@ -609,26 +616,16 @@ func urlQueryEscape(value string) string {
 	return url.QueryEscape(value)
 }
 
-func thinkingSupport(schema json.RawMessage) *pluginapi.ThinkingSupport {
-	if len(schema) == 0 || string(schema) == "null" {
+func thinkingSupport(capability modelcapabilities.Capability) *pluginapi.ThinkingSupport {
+	if len(capability.EffortLevels) == 0 {
 		return nil
 	}
-	var raw any
-	if json.Unmarshal(schema, &raw) != nil {
-		return nil
+	levels := append([]string(nil), capability.EffortLevels...)
+	return &pluginapi.ThinkingSupport{
+		ZeroAllowed:    capability.SupportsEffort("none"),
+		DynamicAllowed: false,
+		Levels:         levels,
 	}
-	encoded, _ := json.Marshal(raw)
-	text := string(encoded)
-	levels := make([]string, 0, 4)
-	for _, level := range []string{"low", "medium", "high", "max"} {
-		if strings.Contains(strings.ToLower(text), `"`+level+`"`) {
-			levels = append(levels, level)
-		}
-	}
-	if len(levels) == 0 {
-		return &pluginapi.ThinkingSupport{DynamicAllowed: true}
-	}
-	return &pluginapi.ThinkingSupport{DynamicAllowed: true, Levels: levels}
 }
 
 type availableProfile struct {
@@ -848,6 +845,19 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return handleLoginForm(req)
 	case "/v0/resource/plugins/kiro/begin":
 		return handleLoginBegin(req)
+	case "/v0/resource/plugins/kiro/capabilities":
+		capabilities := modelcapabilities.Snapshot()
+		sort.Slice(capabilities, func(i, j int) bool { return capabilities[i].ModelID < capabilities[j].ModelID })
+		body, _ := json.Marshal(map[string]any{"provider": providerName, "models": capabilities})
+		return okEnvelope(pluginapi.ManagementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Cache-Control":          []string{"no-store"},
+				"Content-Type":           []string{"application/json"},
+				"X-Content-Type-Options": []string{"nosniff"},
+			},
+			Body: body,
+		})
 	}
 	if req.Path == "/v0/resource/plugins/kiro"+usageResourcePath {
 		return handleUsagePage(req)

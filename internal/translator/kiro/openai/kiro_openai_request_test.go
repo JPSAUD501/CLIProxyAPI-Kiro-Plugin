@@ -3,6 +3,8 @@ package openai
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
 )
 
 func withDeclaredTestTools(t *testing.T, input []byte) []byte {
@@ -78,7 +80,7 @@ func TestToolResultsAttachedToCurrentMessage(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
@@ -145,7 +147,7 @@ func TestToolResultsInHistoryUserMessage(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
@@ -224,7 +226,7 @@ func TestToolResultsWithMultipleToolCalls(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
@@ -286,7 +288,7 @@ func TestToolResultsAtEndOfConversation(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
@@ -362,7 +364,7 @@ func TestToolResultsFollowedByAssistant(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(withDeclaredTestTools(t, input), "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
@@ -411,7 +413,7 @@ func TestAssistantEndsConversation(t *testing.T) {
 		]
 	}`)
 
-	result, _ := BuildKiroPayloadFromOpenAI(input, "kiro-model", "", "CLI", nil, nil)
+	result, _ := BuildKiroPayloadFromOpenAI(input, "kiro-model", "", "CLI", modelcapabilities.Capability{}, "")
 
 	var payload KiroPayload
 	if err := json.Unmarshal(result, &payload); err != nil {
