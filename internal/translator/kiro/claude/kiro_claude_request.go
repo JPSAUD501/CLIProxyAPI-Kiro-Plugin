@@ -99,8 +99,24 @@ type KiroInputSchema struct {
 
 // KiroAssistantResponseMessage represents an assistant message
 type KiroAssistantResponseMessage struct {
-	Content  string        `json:"content"`
-	ToolUses []KiroToolUse `json:"toolUses,omitempty"`
+	Content          string                `json:"content"`
+	ToolUses         []KiroToolUse         `json:"toolUses,omitempty"`
+	ReasoningContent *KiroReasoningContent `json:"reasoningContent,omitempty"`
+}
+
+// KiroReasoningContent is the signed or redacted reasoning payload returned by
+// Kiro. The fields mirror Kiro's conversation-history contract; the plugin
+// never manufactures a signature or redacted payload.
+type KiroReasoningContent struct {
+	ReasoningText   *KiroReasoningText `json:"reasoningText,omitempty"`
+	RedactedContent string             `json:"redactedContent,omitempty"`
+}
+
+// KiroReasoningText contains reasoning text and the upstream signature that
+// authenticates it when the message is replayed to Kiro.
+type KiroReasoningText struct {
+	Text      string `json:"text"`
+	Signature string `json:"signature"`
 }
 
 // KiroToolUse represents a tool invocation by the assistant
@@ -387,6 +403,9 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 	content := msg.Get("content")
 	var contentBuilder strings.Builder
 	var toolUses []KiroToolUse
+	var reasoningText strings.Builder
+	var reasoningSignature string
+	var redactedContent string
 
 	if content.IsArray() {
 		for _, part := range content.Array() {
@@ -394,6 +413,15 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 			switch partType {
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
+			case "thinking":
+				reasoningText.WriteString(part.Get("thinking").String())
+				if signature := part.Get("signature").String(); signature != "" {
+					reasoningSignature = signature
+				}
+			case "redacted_thinking":
+				if data := part.Get("data").String(); data != "" {
+					redactedContent = data
+				}
 			case "tool_use":
 				toolUseID := part.Get("id").String()
 				toolName := part.Get("name").String()
@@ -423,9 +451,21 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 	// client sends an empty string when a turn contains only tool uses. Inventing
 	// visible filler here pollutes the conversation and can be echoed by the model.
 	finalContent := contentBuilder.String()
+	var reasoningContent *KiroReasoningContent
+	if redactedContent != "" {
+		reasoningContent = &KiroReasoningContent{RedactedContent: redactedContent}
+	} else if reasoningText.Len() > 0 && reasoningSignature != "" {
+		reasoningContent = &KiroReasoningContent{
+			ReasoningText: &KiroReasoningText{
+				Text:      reasoningText.String(),
+				Signature: reasoningSignature,
+			},
+		}
+	}
 
 	return KiroAssistantResponseMessage{
-		Content:  finalContent,
-		ToolUses: toolUses,
+		Content:          finalContent,
+		ToolUses:         toolUses,
+		ReasoningContent: reasoningContent,
 	}
 }

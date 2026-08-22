@@ -2,11 +2,16 @@ package responses
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/modelcapabilities"
+	kiroclaude "github.com/JPSAUD501/CLIProxyAPI-Kiro-Plugin/internal/translator/kiro/claude"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func TestResponsesRequestUsesClaudeIntermediateFormat(t *testing.T) {
@@ -170,6 +175,148 @@ func TestNonStreamToolCallProducesResponsesFunctionCall(t *testing.T) {
 	if got := parsed.Get("output.0.call_id").String(); got != "tooluse_1" {
 		t.Fatalf("call_id = %q; response=%s", got, output)
 	}
+}
+
+func TestNonStreamSignedReasoningDoesNotLeakIntoVisibleResponsesText(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"model":"claude-opus-5","input":"Think","reasoning":{"effort":"medium"}}`)
+	request := sdktranslator.TranslateRequest(
+		sdktranslator.FormatOpenAIResponse,
+		sdktranslator.FromString("kiro"),
+		"claude-opus-5",
+		original,
+		false,
+	)
+	claudeResponse := []byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"thinking","thinking":"internal reasoning","signature":"signed-by-upstream"},{"type":"text","text":"Answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+
+	output := sdktranslator.TranslateNonStream(
+		context.Background(),
+		sdktranslator.FromString("kiro"),
+		sdktranslator.FormatOpenAIResponse,
+		"claude-opus-5",
+		original,
+		request,
+		claudeResponse,
+		nil,
+	)
+
+	var visibleText strings.Builder
+	foundReasoning := false
+	for _, item := range gjson.GetBytes(output, "output").Array() {
+		switch item.Get("type").String() {
+		case "message":
+			for _, content := range item.Get("content").Array() {
+				if content.Get("type").String() == "output_text" {
+					visibleText.WriteString(content.Get("text").String())
+				}
+			}
+		case "reasoning":
+			foundReasoning = true
+		}
+	}
+	if visibleText.String() != "Answer" {
+		t.Fatalf("visible text = %q; response=%s", visibleText.String(), output)
+	}
+	if !foundReasoning {
+		t.Fatalf("reasoning item missing; response=%s", output)
+	}
+}
+
+func TestSignedReasoningRoundTripThroughResponsesReachesKiroHistory(t *testing.T) {
+	t.Parallel()
+
+	signature := validClaudeReasoningSignature()
+	original := []byte(`{"model":"claude-opus-5","input":"Think","reasoning":{"effort":"medium"}}`)
+	request := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FromString("kiro"), "claude-opus-5", original, false)
+	claudeResponse := []byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"thinking","thinking":"internal reasoning","signature":"` + signature + `"},{"type":"text","text":"Answer"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}`)
+	response := sdktranslator.TranslateNonStream(context.Background(), sdktranslator.FromString("kiro"), sdktranslator.FormatOpenAIResponse, "claude-opus-5", original, request, claudeResponse, nil)
+
+	input := make([]any, 0)
+	if err := json.Unmarshal([]byte(gjson.GetBytes(response, "output").Raw), &input); err != nil {
+		t.Fatal(err)
+	}
+	input = append(input, map[string]any{
+		"type":    "message",
+		"role":    "user",
+		"content": []any{map[string]any{"type": "input_text", "text": "Continue"}},
+	})
+	nextRequest, err := json.Marshal(map[string]any{"model": "claude-opus-5", "input": input, "reasoning": map[string]any{"effort": "medium"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claudeRequest := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FromString("kiro"), "claude-opus-5", nextRequest, false)
+	kiroPayload, _ := kiroclaude.BuildKiroPayload(claudeRequest, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "medium")
+
+	replayed := gjson.GetBytes(kiroPayload, "conversationState.history.0.assistantResponseMessage.reasoningContent.reasoningText")
+	if replayed.Get("text").String() != "internal reasoning" {
+		t.Fatalf("replayed reasoning text = %q; payload=%s", replayed.Get("text").String(), kiroPayload)
+	}
+	if replayed.Get("signature").String() == "" {
+		t.Fatalf("replayed reasoning signature is empty; payload=%s", kiroPayload)
+	}
+}
+
+func TestStreamingSignedReasoningUsesResponsesReasoningEventsNotOutputText(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"model":"claude-opus-5","input":"Think","reasoning":{"effort":"medium"},"stream":true}`)
+	request := sdktranslator.TranslateRequest(sdktranslator.FormatOpenAIResponse, sdktranslator.FromString("kiro"), "claude-opus-5", original, true)
+	events := [][]byte{
+		[]byte(`event: message_start` + "\n" + `data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-5","stop_reason":null,"usage":{"input_tokens":10,"output_tokens":0}}}`),
+		[]byte(`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"internal reasoning"}}`),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed-by-upstream"}}`),
+		[]byte(`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":0}`),
+		[]byte(`event: content_block_start` + "\n" + `data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}`),
+		[]byte(`event: content_block_delta` + "\n" + `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer"}}`),
+		[]byte(`event: content_block_stop` + "\n" + `data: {"type":"content_block_stop","index":1}`),
+		[]byte(`event: message_delta` + "\n" + `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5}}`),
+		[]byte(`event: message_stop` + "\n" + `data: {"type":"message_stop"}`),
+	}
+
+	var state any
+	var visibleText strings.Builder
+	foundReasoning := false
+	foundCompleted := false
+	for _, event := range events {
+		for _, output := range sdktranslator.TranslateStream(context.Background(), sdktranslator.FromString("kiro"), sdktranslator.FormatOpenAIResponse, "claude-opus-5", original, request, event, &state) {
+			data := parseSSEData(output)
+			eventType := data.Get("type").String()
+			if strings.Contains(eventType, "reasoning") {
+				foundReasoning = true
+			}
+			if eventType == "response.output_text.delta" {
+				visibleText.WriteString(data.Get("delta").String())
+			}
+			if eventType == "response.completed" {
+				foundCompleted = true
+			}
+		}
+	}
+	if visibleText.String() != "Answer" {
+		t.Fatalf("visible text = %q", visibleText.String())
+	}
+	if !foundReasoning || !foundCompleted {
+		t.Fatalf("found reasoning=%v completed=%v", foundReasoning, foundCompleted)
+	}
+}
+
+func validClaudeReasoningSignature() string {
+	channelBlock := []byte{}
+	channelBlock = protowire.AppendTag(channelBlock, 1, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 12)
+	channelBlock = protowire.AppendTag(channelBlock, 2, protowire.VarintType)
+	channelBlock = protowire.AppendVarint(channelBlock, 2)
+	channelBlock = protowire.AppendTag(channelBlock, 6, protowire.BytesType)
+	channelBlock = protowire.AppendString(channelBlock, "claude-opus-5")
+	container := protowire.AppendTag(nil, 1, protowire.BytesType)
+	container = protowire.AppendBytes(container, channelBlock)
+	payload := protowire.AppendTag(nil, 2, protowire.BytesType)
+	payload = protowire.AppendBytes(payload, container)
+	payload = protowire.AppendTag(payload, 3, protowire.VarintType)
+	payload = protowire.AppendVarint(payload, 1)
+	return base64.StdEncoding.EncodeToString(payload)
 }
 
 func TestParallelToolStreamPreservesEveryFunctionIdentity(t *testing.T) {

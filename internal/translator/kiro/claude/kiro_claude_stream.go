@@ -61,6 +61,21 @@ func BuildClaudeContentBlockStartEvent(index int, blockType, toolUseID, toolName
 	return []byte("event: content_block_start\ndata: " + string(result))
 }
 
+// BuildClaudeRedactedThinkingBlockStartEvent forwards Kiro's opaque redacted
+// reasoning payload without attempting to inspect or recreate it.
+func BuildClaudeRedactedThinkingBlockStartEvent(index int, data string) []byte {
+	event := map[string]interface{}{
+		"type":  "content_block_start",
+		"index": index,
+		"content_block": map[string]interface{}{
+			"type": "redacted_thinking",
+			"data": data,
+		},
+	}
+	result, _ := json.Marshal(event)
+	return []byte("event: content_block_start\ndata: " + string(result))
+}
+
 // BuildClaudeStreamEvent creates a text_delta content_block_delta SSE event
 func BuildClaudeStreamEvent(contentDelta string, index int) []byte {
 	event := map[string]interface{}{

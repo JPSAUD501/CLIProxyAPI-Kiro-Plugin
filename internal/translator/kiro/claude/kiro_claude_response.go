@@ -9,11 +9,24 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
-// BuildClaudeResponse preserves text and tool arguments returned by Kiro. Kiro
-// does not provide an Anthropic-verifiable thinking signature in this buffered
-// response path, so the plugin does not manufacture a thinking block.
-func BuildClaudeResponse(content string, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
-	contentBlocks := make([]map[string]interface{}, 0, len(toolUses)+1)
+// BuildClaudeResponse preserves text, signed or redacted reasoning, and tool
+// arguments returned by Kiro. It never manufactures reasoning metadata.
+func BuildClaudeResponse(content string, reasoning *KiroReasoningContent, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
+	contentBlocks := make([]map[string]interface{}, 0, len(toolUses)+2)
+	if reasoning != nil {
+		if reasoning.RedactedContent != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type": "redacted_thinking",
+				"data": reasoning.RedactedContent,
+			})
+		} else if reasoning.ReasoningText != nil && reasoning.ReasoningText.Text != "" && reasoning.ReasoningText.Signature != "" {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type":      "thinking",
+				"thinking":  reasoning.ReasoningText.Text,
+				"signature": reasoning.ReasoningText.Signature,
+			})
+		}
+	}
 	if content != "" {
 		contentBlocks = append(contentBlocks, map[string]interface{}{"type": "text", "text": content})
 	}

@@ -31,3 +31,34 @@ func TestBuildKiroPayloadKeepsToolOnlyTurnContentEmpty(t *testing.T) {
 		t.Fatalf("tool-result-only content = %q, want empty", got)
 	}
 }
+
+func TestBuildKiroPayloadReplaysSignedReasoningWithoutChangingIt(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"messages": [
+			{"role":"user","content":"Think"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"internal reasoning","signature":"signed-by-upstream"},
+				{"type":"text","text":"Answer"}
+			]},
+			{"role":"user","content":"Continue"}
+		]
+	}`)
+	raw, _ := BuildKiroPayload(body, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "medium")
+
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	assistant := payload.ConversationState.History[1].AssistantResponseMessage
+	if assistant == nil || assistant.ReasoningContent == nil || assistant.ReasoningContent.ReasoningText == nil {
+		t.Fatalf("assistant reasoning = %#v", assistant)
+	}
+	if assistant.ReasoningContent.ReasoningText.Text != "internal reasoning" || assistant.ReasoningContent.ReasoningText.Signature != "signed-by-upstream" {
+		t.Fatalf("assistant reasoning = %#v", assistant.ReasoningContent.ReasoningText)
+	}
+	if assistant.Content != "Answer" {
+		t.Fatalf("assistant content = %q", assistant.Content)
+	}
+}

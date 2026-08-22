@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.5.6"
+	pluginVersion     = "0.5.7"
 	maxPages          = 10
 )
 

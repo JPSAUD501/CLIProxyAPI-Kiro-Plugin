@@ -70,12 +70,11 @@ func ProcessToolUseEvent(event map[string]interface{}, current *ToolUseState, pr
 	}
 
 	rawInput := current.InputBuffer.String()
-	if strings.TrimSpace(rawInput) == "" {
-		return nil, nil, fmt.Errorf("kiro: completed tool call %q has empty input", current.ToolUseID)
-	}
-	var input map[string]interface{}
-	if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
-		return nil, nil, fmt.Errorf("kiro: completed tool call %q has invalid JSON input: %w", current.ToolUseID, err)
+	input := make(map[string]interface{})
+	if strings.TrimSpace(rawInput) != "" {
+		if err := json.Unmarshal([]byte(rawInput), &input); err != nil {
+			return nil, nil, fmt.Errorf("kiro: completed tool call %q has invalid JSON input: %w", current.ToolUseID, err)
+		}
 	}
 
 	toolUse := KiroToolUse{ToolUseID: current.ToolUseID, Name: current.Name, Input: input}
