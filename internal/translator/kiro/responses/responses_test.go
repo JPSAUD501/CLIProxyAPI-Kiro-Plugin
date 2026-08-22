@@ -172,6 +172,55 @@ func TestNonStreamToolCallProducesResponsesFunctionCall(t *testing.T) {
 	}
 }
 
+func TestParallelToolStreamPreservesEveryFunctionIdentity(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"model":"claude-opus-5","input":"Run both","tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object"}},{"type":"function","name":"write_stdin","description":"Write to a session","parameters":{"type":"object"}}],"stream":true}`)
+	request := sdktranslator.TranslateRequest(
+		sdktranslator.FormatOpenAIResponse,
+		sdktranslator.FromString("kiro"),
+		"claude-opus-5",
+		original,
+		true,
+	)
+	events := [][]byte{
+		[]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-opus-5\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}"),
+		[]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"exec_command\",\"input\":{}}}"),
+		[]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}"),
+		[]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}"),
+		[]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"write_stdin\",\"input\":{}}}"),
+		[]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"session_id\\\":1}\"}}"),
+		[]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}"),
+		[]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}"),
+		[]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}"),
+	}
+
+	var state any
+	doneByCallID := make(map[string]string)
+	for _, event := range events {
+		outputs := sdktranslator.TranslateStream(
+			context.Background(),
+			sdktranslator.FromString("kiro"),
+			sdktranslator.FormatOpenAIResponse,
+			"claude-opus-5",
+			original,
+			request,
+			event,
+			&state,
+		)
+		for _, output := range outputs {
+			data := parseSSEData(output)
+			if data.Get("type").String() == "response.output_item.done" && data.Get("item.type").String() == "function_call" {
+				doneByCallID[data.Get("item.call_id").String()] = data.Get("item.name").String()
+			}
+		}
+	}
+
+	if len(doneByCallID) != 2 || doneByCallID["call_1"] != "exec_command" || doneByCallID["call_2"] != "write_stdin" {
+		t.Fatalf("completed function identities = %#v", doneByCallID)
+	}
+}
+
 func parseSSEData(frame []byte) gjson.Result {
 	for _, line := range strings.Split(string(frame), "\n") {
 		if strings.HasPrefix(line, "data:") {

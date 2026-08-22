@@ -28,8 +28,11 @@ func TestResponsesRequestBuildsValidKiroPayload(t *testing.T) {
 	)
 
 	parsed := gjson.ParseBytes(payload)
-	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "Run pwd" {
+	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "Be concise.\n\nRun pwd" {
 		t.Fatalf("current message = %q; payload=%s", got, payload)
+	}
+	if parsed.Get("systemPrompt").Exists() || parsed.Get("agentMode").Exists() {
+		t.Fatalf("payload contains feature-gated fields: %s", payload)
 	}
 	if got := parsed.Get("conversationState.currentMessage.userInputMessage.userInputMessageContext.tools.0.toolSpecification.name").String(); got != "exec_command" {
 		t.Fatalf("tool name = %q; payload=%s", got, payload)
@@ -39,5 +42,65 @@ func TestResponsesRequestBuildsValidKiroPayload(t *testing.T) {
 	}
 	if got := parsed.Get("profileArn").String(); got == "" {
 		t.Fatalf("profileArn is empty; payload=%s", payload)
+	}
+}
+
+func TestResponsesRequestDropsUnsupportedWebSearchAndKeepsFunctionTools(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{"model":"claude-opus-5","input":"Run pwd","tools":[{"type":"function","name":"exec_command","description":"Run a command","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}},{"type":"web_search","external_web_access":true}]}`)
+	intermediate := sdktranslator.TranslateRequest(
+		sdktranslator.FormatOpenAIResponse,
+		sdktranslator.FromString("kiro"),
+		"claude-opus-5",
+		original,
+		false,
+	)
+	intermediate, err := normalizeKiroTools(intermediate, sdktranslator.FormatOpenAIResponse)
+	if err != nil {
+		t.Fatalf("filter tools: %v", err)
+	}
+	if err := validateKiroRequest(original, intermediate, sdktranslator.FormatOpenAIResponse); err != nil {
+		t.Fatalf("filtered Responses request rejected: %v; body=%s", err, intermediate)
+	}
+
+	tools := gjson.GetBytes(intermediate, "tools").Array()
+	if len(tools) != 1 || tools[0].Get("name").String() != "exec_command" {
+		t.Fatalf("unexpected intermediate tools: %s", intermediate)
+	}
+
+	payload, _ := buildKiroPayloadForFormat(
+		intermediate,
+		"claude-opus-5",
+		"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+		"AI_EDITOR",
+		sdktranslator.FormatOpenAIResponse,
+		nil,
+	)
+	payloadTools := gjson.GetBytes(payload, "conversationState.currentMessage.userInputMessage.userInputMessageContext.tools").Array()
+	if len(payloadTools) != 1 || payloadTools[0].Get("toolSpecification.name").String() != "exec_command" {
+		t.Fatalf("unexpected Kiro payload tools: %s", payload)
+	}
+}
+
+func TestAnthropicSystemInstructionsArePreservedWithoutFeatureGatedFields(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"system":"Base instructions.\n\nSession instructions.","messages":[{"role":"user","content":"Reply exactly OK."}]}`)
+	payload, _ := buildKiroPayloadForFormat(
+		body,
+		"claude-opus-5",
+		"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+		"AI_EDITOR",
+		sdktranslator.FormatClaude,
+		nil,
+	)
+
+	parsed := gjson.ParseBytes(payload)
+	if parsed.Get("systemPrompt").Exists() || parsed.Get("agentMode").Exists() {
+		t.Fatalf("payload contains feature-gated fields: %s", payload)
+	}
+	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "Base instructions.\n\nSession instructions.\n\nReply exactly OK." {
+		t.Fatalf("current user content = %q", got)
 	}
 }

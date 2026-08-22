@@ -21,7 +21,6 @@ type KiroPayload struct {
 	ConversationState            KiroConversationState `json:"conversationState"`
 	ProfileArn                   string                `json:"profileArn,omitempty"`
 	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
-	SystemPrompt                 string                `json:"systemPrompt,omitempty"`
 }
 
 // KiroConversationState holds the conversation context
@@ -143,6 +142,9 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
+	if currentUserMsg != nil {
+		currentUserMsg.Content = kirocommon.PrependInstructions(currentUserMsg.Content, systemPrompt)
+	}
 
 	// Build the current user content. Reasoning configuration remains a
 	// top-level upstream field and is not mixed into conversation text.
@@ -176,7 +178,6 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 		},
 		ProfileArn:                   profileArn,
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, gjson.GetBytes(claudeBody, "max_tokens").Int()),
-		SystemPrompt:                 systemPrompt,
 	}
 
 	result, err := json.Marshal(payload)

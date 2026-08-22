@@ -706,6 +706,10 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body, normalizeErr := normalizeKiroRequest(body, from)
+	if normalizeErr != nil {
+		return resp, requestValidationErr{msg: normalizeErr.Error()}
+	}
 	if err := validateKiroRequest(req.Payload, body, from); err != nil {
 		return resp, err
 	}
@@ -1099,6 +1103,10 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
+	body, normalizeErr := normalizeKiroRequest(body, from)
+	if normalizeErr != nil {
+		return nil, requestValidationErr{msg: normalizeErr.Error()}
+	}
 	if err := validateKiroRequest(req.Payload, body, from); err != nil {
 		return nil, err
 	}

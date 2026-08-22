@@ -11,6 +11,8 @@ The plugin:
 - exposes upstream model IDs without a `kiro/` prefix;
 - supports OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages;
 - supports streaming, tool calls, token refresh, multiple accounts, and failover;
+- forwards client-executed function tools, bounds their descriptions to Kiro's upstream limit, and omits server-side tools that Kiro cannot execute;
+- preserves system and developer instructions in Kiro's current user input because the upstream `systemPrompt` field is feature-gated;
 - provides a read-only `Kiro Usage` page for subscription usage.
 
 `Kiro` is the name shown in the CLIProxyAPI interface. The stable provider ID, configuration key, and DLL filename use `kiro`.

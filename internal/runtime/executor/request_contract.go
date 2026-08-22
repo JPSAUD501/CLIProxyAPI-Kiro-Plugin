@@ -3,10 +3,180 @@ package executor
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
+
+const maxKiroToolDescriptionBytes = 10240
+
+func normalizeKiroRequest(body []byte, source sdktranslator.Format) ([]byte, error) {
+	normalized, err := normalizeKiroTools(body, source)
+	if err != nil {
+		return nil, err
+	}
+	if source.String() == sdktranslator.FormatOpenAI.String() {
+		return normalized, nil
+	}
+	return normalizeClaudeSystemMessages(normalized)
+}
+
+// normalizeKiroTools removes server-side tools that Kiro cannot execute and
+// bounds client-side tool descriptions to the upstream contract.
+func normalizeKiroTools(body []byte, source sdktranslator.Format) ([]byte, error) {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body, nil
+	}
+
+	openAIChat := source.String() == sdktranslator.FormatOpenAI.String()
+	kept := make([]string, 0, len(tools.Array()))
+	changed := false
+	for _, tool := range tools.Array() {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		supported := toolType == ""
+		if openAIChat {
+			supported = toolType == "function"
+		}
+		if supported {
+			normalized, err := normalizeKiroToolDescription([]byte(tool.Raw), openAIChat)
+			if err != nil {
+				return nil, err
+			}
+			kept = append(kept, string(normalized))
+			changed = changed || string(normalized) != tool.Raw
+		} else {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, nil
+	}
+	if len(kept) == 0 {
+		return sjson.DeleteBytes(body, "tools")
+	}
+
+	filtered, err := sjson.SetRawBytes(body, "tools", []byte("["+strings.Join(kept, ",")+"]"))
+	if err != nil {
+		return nil, fmt.Errorf("filter Kiro tools: %w", err)
+	}
+	return filtered, nil
+}
+
+func normalizeKiroToolDescription(tool []byte, openAIChat bool) ([]byte, error) {
+	descriptionPath := "description"
+	namePath := "name"
+	if openAIChat {
+		descriptionPath = "function.description"
+		namePath = "function.name"
+	}
+
+	description := gjson.GetBytes(tool, descriptionPath).String()
+	normalized := description
+	if strings.TrimSpace(normalized) == "" {
+		normalized = strings.TrimSpace(gjson.GetBytes(tool, namePath).String())
+	}
+	normalized = truncateUTF8(normalized, maxKiroToolDescriptionBytes)
+	if normalized == description {
+		return tool, nil
+	}
+
+	updated, err := sjson.SetBytes(tool, descriptionPath, normalized)
+	if err != nil {
+		return nil, fmt.Errorf("normalize Kiro tool description: %w", err)
+	}
+	return updated, nil
+}
+
+func truncateUTF8(value string, maxBytes int) string {
+	if maxBytes < 1 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	value = value[:maxBytes]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+func normalizeClaudeSystemMessages(body []byte) ([]byte, error) {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body, nil
+	}
+
+	systemParts, err := claudeSystemTextParts(gjson.GetBytes(body, "system"))
+	if err != nil {
+		return nil, err
+	}
+	kept := make([]string, 0, len(messages.Array()))
+	changed := false
+	for _, message := range messages.Array() {
+		if message.Get("role").String() != "system" {
+			kept = append(kept, message.Raw)
+			continue
+		}
+		changed = true
+		parts, err := claudeSystemTextParts(message.Get("content"))
+		if err != nil {
+			return nil, err
+		}
+		systemParts = append(systemParts, parts...)
+	}
+	if !changed {
+		return body, nil
+	}
+
+	normalized, err := sjson.SetRawBytes(body, "messages", []byte("["+strings.Join(kept, ",")+"]"))
+	if err != nil {
+		return nil, fmt.Errorf("normalize Kiro conversation messages: %w", err)
+	}
+	if len(systemParts) == 0 {
+		normalized, err = sjson.DeleteBytes(normalized, "system")
+	} else {
+		normalized, err = sjson.SetBytes(normalized, "system", strings.Join(systemParts, "\n\n"))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("normalize Kiro system prompt: %w", err)
+	}
+	return normalized, nil
+}
+
+func claudeSystemTextParts(content gjson.Result) ([]string, error) {
+	if !content.Exists() || content.Type == gjson.Null {
+		return nil, nil
+	}
+	if content.Type == gjson.String {
+		if content.String() == "" {
+			return nil, nil
+		}
+		return []string{content.String()}, nil
+	}
+	if !content.IsArray() {
+		return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
+	}
+	parts := make([]string, 0, len(content.Array()))
+	for _, block := range content.Array() {
+		if block.Type == gjson.String {
+			if block.String() != "" {
+				parts = append(parts, block.String())
+			}
+			continue
+		}
+		if block.Get("type").String() != "text" {
+			return nil, fmt.Errorf("Kiro supports only text in Anthropic system messages")
+		}
+		if block.Get("text").String() != "" {
+			parts = append(parts, block.Get("text").String())
+		}
+	}
+	return parts, nil
+}
 
 func validateKiroRequest(original, translated []byte, source sdktranslator.Format) error {
 	if err := validateUnsupportedControls(original, source.String()); err != nil {
@@ -21,7 +191,7 @@ func validateKiroRequest(original, translated []byte, source sdktranslator.Forma
 	if err := validateClaudeTools(translated); err != nil {
 		return requestValidationErr{msg: err.Error()}
 	}
-	return validateClaudeConversation(translated)
+	return validateClaudeConversation(translated, source.String())
 }
 
 func validateUnsupportedControls(body []byte, source string) error {
@@ -64,7 +234,7 @@ func validateOpenAIToolChoice(choice gjson.Result) error {
 	return fmt.Errorf("Kiro does not support OpenAI tool_choice=%s natively", choice.Raw)
 }
 
-func validateClaudeConversation(body []byte) error {
+func validateClaudeConversation(body []byte, source string) error {
 	messages := gjson.GetBytes(body, "messages").Array()
 	if len(messages) == 0 {
 		return requestValidationErr{msg: "Kiro requires at least one user message"}
@@ -89,8 +259,18 @@ func validateClaudeConversation(body []byte) error {
 				id := strings.TrimSpace(block.Get("id").String())
 				name := strings.TrimSpace(block.Get("name").String())
 				input := block.Get("input")
-				if id == "" || name == "" || !input.IsObject() {
-					return requestValidationErr{msg: "Kiro requires every Anthropic tool_use to have an id, name, and object input"}
+				toolCallKind := "an Anthropic tool_use"
+				if source == sdktranslator.FormatOpenAIResponse.String() {
+					toolCallKind = "an OpenAI Responses function_call"
+				}
+				if id == "" {
+					return requestValidationErr{msg: fmt.Sprintf("Kiro cannot replay %s without an id", toolCallKind)}
+				}
+				if name == "" {
+					return requestValidationErr{msg: fmt.Sprintf("Kiro cannot replay %s without a name", toolCallKind)}
+				}
+				if !input.IsObject() {
+					return requestValidationErr{msg: fmt.Sprintf("Kiro cannot replay %s whose input is not an object", toolCallKind)}
 				}
 				if _, exists := pendingToolUses[id]; exists {
 					return requestValidationErr{msg: fmt.Sprintf("duplicate Anthropic tool_use id %q", id)}
@@ -243,7 +423,7 @@ func validateToolDefinition(name, description string, schema gjson.Result) error
 	if strings.TrimSpace(name) == "" || len(name) > 64 {
 		return fmt.Errorf("Kiro tool names must contain between 1 and 64 bytes")
 	}
-	if strings.TrimSpace(description) == "" || len(description) > 10240 {
+	if strings.TrimSpace(description) == "" || len(description) > maxKiroToolDescriptionBytes {
 		return fmt.Errorf("Kiro tool descriptions must contain between 1 and 10240 bytes")
 	}
 	if !schema.Exists() || !schema.IsObject() {

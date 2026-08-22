@@ -21,7 +21,6 @@ type KiroPayload struct {
 	ConversationState            KiroConversationState `json:"conversationState"`
 	ProfileArn                   string                `json:"profileArn,omitempty"`
 	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
-	SystemPrompt                 string                `json:"systemPrompt,omitempty"`
 }
 
 // KiroConversationState holds the conversation context
@@ -143,8 +142,11 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processOpenAIMessages(messages, modelID, origin)
+	if currentUserMsg != nil {
+		currentUserMsg.Content = kirocommon.PrependInstructions(currentUserMsg.Content, systemPrompt)
+	}
 
-	// Build content with system prompt
+	// Attach tools and tool results to the current input.
 	if currentUserMsg != nil {
 		// Build userInputMessageContext with tools and tool results
 		if len(kiroTools) > 0 || len(currentToolResults) > 0 {
@@ -179,7 +181,6 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 		},
 		ProfileArn:                   profileArn,
 		AdditionalModelRequestFields: capability.AdditionalFieldsForRequest(effort, maxTokens),
-		SystemPrompt:                 systemPrompt,
 	}
 
 	result, err := json.Marshal(payload)
@@ -215,7 +216,8 @@ func extractSystemPromptFromOpenAI(messages gjson.Result) string {
 
 	var systemParts []string
 	for _, msg := range messages.Array() {
-		if msg.Get("role").String() == "system" {
+		role := msg.Get("role").String()
+		if role == "system" || role == "developer" {
 			content := msg.Get("content")
 			if content.Type == gjson.String {
 				systemParts = append(systemParts, content.String())
@@ -293,7 +295,7 @@ func processOpenAIMessages(messages gjson.Result, modelID, origin string) ([]Kir
 		isLastMessage := i == len(messagesArray)-1
 
 		switch role {
-		case "system":
+		case "system", "developer":
 			// System messages are handled separately via extractSystemPromptFromOpenAI
 			continue
 
