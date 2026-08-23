@@ -73,7 +73,7 @@ import (
 const (
 	providerName      = "kiro"
 	pluginDisplayName = "Kiro"
-	pluginVersion     = "0.5.8"
+	pluginVersion     = "0.5.9"
 	maxPages          = 10
 )
 
@@ -550,7 +550,11 @@ func isKiroAuthorizationError(err error) bool {
 }
 
 func normalizeModelID(id string) string {
-	return strings.TrimSpace(id)
+	id = strings.TrimSpace(id)
+	if strings.EqualFold(id, "auto") {
+		return "kiro/auto"
+	}
+	return id
 }
 
 type controlPlaneModel struct {

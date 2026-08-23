@@ -166,7 +166,7 @@ func (e requestStatusError) StatusCode() int { return e.status }
 func TestNormalizeModelIDUsesUpstreamID(t *testing.T) {
 	tests := map[string]string{
 		"claude-sonnet-4.5": "claude-sonnet-4.5",
-		" auto ":            "auto",
+		" auto ":            "kiro/auto",
 	}
 	for input, expected := range tests {
 		if actual := normalizeModelID(input); actual != expected {
