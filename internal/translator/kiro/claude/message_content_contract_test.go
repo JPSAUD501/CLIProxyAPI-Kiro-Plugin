@@ -32,6 +32,31 @@ func TestBuildKiroPayloadKeepsToolOnlyTurnContentEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildKiroPayloadAnchorsSystemInstructionsToFirstUserTurn(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"system": [{"type":"text","text":"Follow the repository rules."}],
+		"messages": [
+			{"role":"user","content":"Run pwd"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"exec_command","input":{"cmd":"pwd"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}
+		]
+	}`)
+	raw, _ := BuildKiroPayload(body, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "Follow the repository rules.\n\nRun pwd" {
+		t.Fatalf("first user content = %q", got)
+	}
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "" {
+		t.Fatalf("tool-result current content = %q, want empty", got)
+	}
+}
+
 func TestBuildKiroPayloadReplaysSignedReasoningWithoutChangingIt(t *testing.T) {
 	t.Parallel()
 

@@ -158,9 +158,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
-	if currentUserMsg != nil {
-		currentUserMsg.Content = kirocommon.PrependInstructions(currentUserMsg.Content, systemPrompt)
-	}
+	attachInstructionsToFirstUserMessage(history, currentUserMsg, systemPrompt)
 
 	// Build the current user content. Reasoning configuration remains a
 	// top-level upstream field and is not mixed into conversation text.
@@ -203,6 +201,28 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, cap
 	}
 
 	return result, thinkingEnabled
+}
+
+// attachInstructionsToFirstUserMessage preserves system instructions exactly
+// once in the stateless Kiro conversation. Kiro rejects the feature-gated
+// systemPrompt field, so instructions must be represented as user content. By
+// anchoring them to the earliest user turn, tool-result continuations remain
+// clean and do not repeatedly trigger instruction-driven behavior.
+func attachInstructionsToFirstUserMessage(history []KiroHistoryMessage, current *KiroUserInputMessage, instructions string) {
+	if instructions == "" {
+		return
+	}
+
+	for i := range history {
+		if history[i].UserInputMessage != nil {
+			history[i].UserInputMessage.Content = kirocommon.PrependInstructions(history[i].UserInputMessage.Content, instructions)
+			return
+		}
+	}
+
+	if current != nil {
+		current.Content = kirocommon.PrependInstructions(current.Content, instructions)
+	}
 }
 
 // normalizeOrigin normalizes origin value for Kiro API compatibility

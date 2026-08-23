@@ -142,9 +142,7 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processOpenAIMessages(messages, modelID, origin)
-	if currentUserMsg != nil {
-		currentUserMsg.Content = kirocommon.PrependInstructions(currentUserMsg.Content, systemPrompt)
-	}
+	attachInstructionsToFirstUserMessage(history, currentUserMsg, systemPrompt)
 
 	// Attach tools and tool results to the current input.
 	if currentUserMsg != nil {
@@ -190,6 +188,27 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 	}
 
 	return result, thinkingEnabled
+}
+
+// attachInstructionsToFirstUserMessage preserves system and developer
+// instructions exactly once in the stateless Kiro conversation. Kiro rejects
+// the feature-gated systemPrompt field, so the earliest user turn carries the
+// instructions without contaminating later tool-result continuations.
+func attachInstructionsToFirstUserMessage(history []KiroHistoryMessage, current *KiroUserInputMessage, instructions string) {
+	if instructions == "" {
+		return
+	}
+
+	for i := range history {
+		if history[i].UserInputMessage != nil {
+			history[i].UserInputMessage.Content = kirocommon.PrependInstructions(history[i].UserInputMessage.Content, instructions)
+			return
+		}
+	}
+
+	if current != nil {
+		current.Content = kirocommon.PrependInstructions(current.Content, instructions)
+	}
 }
 
 // normalizeOrigin normalizes origin value for Kiro API compatibility

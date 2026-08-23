@@ -28,8 +28,11 @@ func TestBuildKiroPayloadPreservesInstructionsAndCompleteHistory(t *testing.T) {
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("invalid payload: %v", err)
 	}
-	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "Keep answers short.\n\nlatest" {
-		t.Fatalf("instructions or current message were not mapped: %q", got)
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "Keep answers short.\n\nquestion 0" {
+		t.Fatalf("instructions were not anchored to the first user message: %q", got)
+	}
+	if got := payload.ConversationState.CurrentMessage.UserInputMessage.Content; got != "latest" {
+		t.Fatalf("current message was changed: %q", got)
 	}
 	if len(payload.ConversationState.History) != 60 {
 		t.Fatalf("history length = %d, want all 60 messages", len(payload.ConversationState.History))
@@ -41,6 +44,36 @@ func TestBuildKiroPayloadPreservesInstructionsAndCompleteHistory(t *testing.T) {
 		if i%2 == 1 && message.AssistantResponseMessage == nil {
 			t.Fatalf("history[%d] must be an assistant message", i)
 		}
+	}
+}
+
+func TestBuildKiroPayloadAnchorsSystemAndDeveloperBeforeToolContinuation(t *testing.T) {
+	t.Parallel()
+
+	request := []byte(`{
+		"messages": [
+			{"role":"system","content":"Base rules."},
+			{"role":"developer","content":"Repository rules."},
+			{"role":"user","content":"Run pwd"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		]
+	}`)
+
+	raw, _ := BuildKiroPayloadFromOpenAI(request, "claude-opus-5", "profile", "AI_EDITOR", modelcapabilities.Capability{}, "")
+	var payload KiroPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("invalid payload: %v", err)
+	}
+	if got := payload.ConversationState.History[0].UserInputMessage.Content; got != "Base rules.\nRepository rules.\n\nRun pwd" {
+		t.Fatalf("first user content = %q", got)
+	}
+	current := payload.ConversationState.CurrentMessage.UserInputMessage
+	if current.Content != "" {
+		t.Fatalf("tool-result current content = %q, want empty", current.Content)
+	}
+	if current.UserInputMessageContext == nil || len(current.UserInputMessageContext.ToolResults) != 1 {
+		t.Fatalf("current tool results = %#v", current.UserInputMessageContext)
 	}
 }
 

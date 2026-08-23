@@ -45,6 +45,46 @@ func TestResponsesRequestBuildsValidKiroPayload(t *testing.T) {
 	}
 }
 
+func TestResponsesToolContinuationKeepsInstructionsOnFirstUserTurn(t *testing.T) {
+	t.Parallel()
+
+	original := []byte(`{
+		"model":"claude-opus-5",
+		"instructions":"Follow the repository rules.",
+		"input":[
+			{"role":"user","content":[{"type":"input_text","text":"Run pwd"}]},
+			{"type":"function_call","id":"fc_1","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+	intermediate := sdktranslator.TranslateRequest(
+		sdktranslator.FormatOpenAIResponse,
+		sdktranslator.FromString("kiro"),
+		"claude-opus-5",
+		original,
+		false,
+	)
+	payload, _ := buildKiroPayloadForFormat(
+		intermediate,
+		"claude-opus-5",
+		"arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+		"AI_EDITOR",
+		sdktranslator.FormatOpenAIResponse,
+		nil,
+	)
+
+	parsed := gjson.ParseBytes(payload)
+	if got := parsed.Get("conversationState.history.0.userInputMessage.content").String(); got != "Follow the repository rules.\n\nRun pwd" {
+		t.Fatalf("first user content = %q; intermediate=%s; payload=%s", got, intermediate, payload)
+	}
+	if got := parsed.Get("conversationState.currentMessage.userInputMessage.content").String(); got != "" {
+		t.Fatalf("tool-result current content = %q, want empty; payload=%s", got, payload)
+	}
+	if got := parsed.Get("conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults.0.toolUseId").String(); got != "call_1" {
+		t.Fatalf("tool result id = %q; payload=%s", got, payload)
+	}
+}
+
 func TestResponsesRequestDropsUnsupportedWebSearchAndKeepsFunctionTools(t *testing.T) {
 	t.Parallel()
 
